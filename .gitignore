@@ -1,0 +1,16 @@
+.build/
+.swiftpm/
+DerivedData/
+.DS_Store
+*.xcuserdata/
+*.xcuserstate
+
+.knowns/
+.vscode/
+docs/
+
+.qdrant-initialized
+AGENTS.md
+Swoosh.zip
+Swoosh.app
+typescript
