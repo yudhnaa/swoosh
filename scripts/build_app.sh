@@ -62,7 +62,6 @@ if [[ -z "${CODESIGN_IDENTITY}" ]]; then
     CODESIGN_IDENTITY="$(auto_detect_codesign_identity)"
 fi
 
-BUILD_DIR=".build/${CONFIGURATION}"
 APP_DIR="${APP_NAME}.app"
 CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
@@ -70,6 +69,7 @@ RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 
 echo "Building ${CONFIGURATION} binary..."
 swift build -c "${CONFIGURATION}" --product swoosh
+BUILD_DIR="$(swift build -c "${CONFIGURATION}" --show-bin-path)"
 
 echo "Creating app bundle structure..."
 rm -rf "${APP_DIR}"
