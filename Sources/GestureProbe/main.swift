@@ -9,6 +9,8 @@ struct ProbeOptions {
     var includeAXHitTest = true
     var includePrivateMultitouch = true
     var healthInterval: TimeInterval = 5
+    var privateDeviceFilter: PrivateDeviceFilter = .all
+    var maxTouchFramesPerDevice = 120
 
     static func parse(_ arguments: [String]) -> ProbeOptions {
         var options = ProbeOptions()
@@ -28,6 +30,22 @@ struct ProbeOptions {
             case "--health-interval" where index + 1 < arguments.count:
                 options.healthInterval = TimeInterval(arguments[index + 1]) ?? options.healthInterval
                 index += 2
+            case "--private-device-filter" where index + 1 < arguments.count:
+                guard let filter = PrivateDeviceFilter(rawValue: arguments[index + 1]) else {
+                    fputs("Invalid --private-device-filter: \(arguments[index + 1])\n\n", stderr)
+                    printHelp()
+                    Foundation.exit(2)
+                }
+                options.privateDeviceFilter = filter
+                index += 2
+            case "--max-touch-frames-per-device" where index + 1 < arguments.count:
+                guard let limit = Int(arguments[index + 1]), limit >= 0 else {
+                    fputs("--max-touch-frames-per-device must be a non-negative integer\n\n", stderr)
+                    printHelp()
+                    Foundation.exit(2)
+                }
+                options.maxTouchFramesPerDevice = limit
+                index += 2
             case "--help", "-h":
                 printHelp()
                 Foundation.exit(0)
@@ -46,7 +64,10 @@ struct ProbeOptions {
         gesture-probe records documented macOS input evidence as newline-delimited JSON.
 
         Usage:
-          swift run gesture-probe [--duration seconds] [--no-ax-hit-test] [--no-private-multitouch] [--health-interval seconds]
+          swift run gesture-probe [--duration seconds] [--no-ax-hit-test] [--no-private-multitouch]
+                                  [--health-interval seconds]
+                                  [--private-device-filter all|built-in|external]
+                                  [--max-touch-frames-per-device count]
 
         During capture, place the pointer on Finder, Safari, and TextEdit titlebars and try:
           - horizontal and vertical two-finger strokes
@@ -60,8 +81,26 @@ struct ProbeOptions {
 
         By default the probe also attempts to runtime-load Apple's private
         MultitouchSupport.framework to emit sanitized touch-frame and derived pinch
-        feasibility data. Use --no-private-multitouch to disable that path.
+        feasibility data. Use --no-private-multitouch to disable that path. Private
+        touch-frame logging is capped per device; derived gesture summaries continue.
         """)
+    }
+}
+
+enum PrivateDeviceFilter: String {
+    case all
+    case builtIn = "built-in"
+    case external
+
+    func includes(isBuiltIn: Bool?) -> Bool {
+        switch self {
+        case .all:
+            return true
+        case .builtIn:
+            return isBuiltIn == true
+        case .external:
+            return isBuiltIn == false
+        }
     }
 }
 
@@ -250,7 +289,12 @@ final class ProbeState {
             return
         }
 
-        privateMultitouch = PrivateMultitouchProbe(logger: logger, includeAXHitTest: options.includeAXHitTest)
+        privateMultitouch = PrivateMultitouchProbe(
+            logger: logger,
+            includeAXHitTest: options.includeAXHitTest,
+            deviceFilter: options.privateDeviceFilter,
+            maxTouchFramesPerDevice: options.maxTouchFramesPerDevice
+        )
         privateMultitouch?.start()
     }
 
@@ -434,10 +478,16 @@ final class PrivateMultitouchProbe {
 
     private let logger: JSONLogger
     private let includeAXHitTest: Bool
+    private let deviceFilter: PrivateDeviceFilter
+    private let maxTouchFramesPerDevice: Int
     private var handle: UnsafeMutableRawPointer?
     private var devices: [MTDeviceRef] = []
-    private var recognizer = TouchGestureRecognizer()
     private let lock = NSLock()
+    private var deviceLabelsByPointer: [UInt: String] = [:]
+    private var deviceBuiltInByLabel: [String: Bool?] = [:]
+    private var recognizersByDeviceLabel: [String: TouchGestureRecognizer] = [:]
+    private var emittedTouchFrameCountsByLabel: [String: Int] = [:]
+    private var touchFrameSuppressionLoggedByLabel: Set<String> = []
 
     private var createList: MTDeviceCreateListFn?
     private var registerWithRefcon: MTRegisterContactFrameCallbackWithRefconFn?
@@ -452,9 +502,16 @@ final class PrivateMultitouchProbe {
         !devices.isEmpty
     }
 
-    init(logger: JSONLogger, includeAXHitTest: Bool) {
+    init(
+        logger: JSONLogger,
+        includeAXHitTest: Bool,
+        deviceFilter: PrivateDeviceFilter,
+        maxTouchFramesPerDevice: Int
+    ) {
         self.logger = logger
         self.includeAXHitTest = includeAXHitTest
+        self.deviceFilter = deviceFilter
+        self.maxTouchFramesPerDevice = maxTouchFramesPerDevice
     }
 
     deinit {
@@ -506,6 +563,15 @@ final class PrivateMultitouchProbe {
 
             let device = UnsafeMutableRawPointer(mutating: rawDevice)
             let metadata = deviceMetadata(device: device, index: index)
+            let isBuiltIn = metadata["builtIn"] as? Bool
+
+            guard deviceFilter.includes(isBuiltIn: isBuiltIn) else {
+                var skipped = metadata
+                skipped["started"] = false
+                skipped["startSkippedReason"] = "excluded by --private-device-filter \(deviceFilter.rawValue)"
+                startedDevices.append(skipped)
+                continue
+            }
 
             if let registerWithRefcon {
                 registerWithRefcon(device, PrivateMultitouchBridge.callbackWithRefcon, refcon)
@@ -541,8 +607,10 @@ final class PrivateMultitouchProbe {
             "frameworkPath": Self.frameworkPath,
             "usesPrivateAPI": true,
             "callbackMode": registerWithRefcon == nil ? "global-fallback" : "refcon",
+            "deviceFilter": deviceFilter.rawValue,
+            "maxTouchFramesPerDevice": maxTouchFramesPerDevice,
             "devices": startedDevices,
-            "note": "Private feasibility probe only; emits sanitized touch and derived gesture data."
+            "note": "Private feasibility probe only; device labels are session-local and raw touch-frame logging is capped."
         ])
     }
 
@@ -574,36 +642,58 @@ final class PrivateMultitouchProbe {
         let axPayload = includeAXHitTest ? accessibilityHitTest(at: pointerLocation) : nil
         let modifierFlags = CGEvent(source: nil)?.flags.rawValue ?? 0
 
+        let deviceLabel = sessionDeviceLabel(for: device)
+        let deviceBuiltIn = deviceBuiltInByLabel[deviceLabel] ?? nil
         var events: [[String: Any]] = []
         lock.lock()
+        let recognizer = recognizersByDeviceLabel[deviceLabel] ?? TouchGestureRecognizer()
+        recognizersByDeviceLabel[deviceLabel] = recognizer
         let updates = recognizer.process(touches: touches, timestamp: timestamp, frame: frame)
         lock.unlock()
 
-        var framePayload: [String: Any] = [
-            "kind": "event",
-            "timestamp": isoTimestamp(),
-            "source": "private-multitouch",
-            "type": "touch-frame",
-            "usesPrivateAPI": true,
-            "devicePointer": device.map { String(UInt(bitPattern: $0), radix: 16) } ?? "",
-            "frame": frame,
-            "deviceTimestamp": timestamp,
-            "touchCount": touches.count,
-            "pointerLocation": pointPayload(pointerLocation),
-            "modifierFlags": modifierFlags,
-            "touches": touches.map { $0.payload }
-        ]
+        if shouldEmitTouchFrame(for: deviceLabel) {
+            var framePayload: [String: Any] = [
+                "kind": "event",
+                "timestamp": isoTimestamp(),
+                "source": "private-multitouch",
+                "type": "touch-frame",
+                "usesPrivateAPI": true,
+                "deviceLabel": deviceLabel,
+                "deviceBuiltIn": deviceBuiltInPayload(deviceBuiltIn),
+                "frame": frame,
+                "deviceTimestamp": timestamp,
+                "touchCount": touches.count,
+                "pointerLocation": pointPayload(pointerLocation),
+                "modifierFlags": modifierFlags,
+                "touches": touches.map { $0.payload }
+            ]
 
-        if let axPayload {
-            framePayload["accessibilityHitTest"] = axPayload
+            if let axPayload {
+                framePayload["accessibilityHitTest"] = axPayload
+            }
+            events.append(framePayload)
+        } else if !touchFrameSuppressionLoggedByLabel.contains(deviceLabel) {
+            touchFrameSuppressionLoggedByLabel.insert(deviceLabel)
+            events.append([
+                "kind": "event",
+                "timestamp": isoTimestamp(),
+                "source": "private-multitouch",
+                "type": "touch-frame-suppressed",
+                "usesPrivateAPI": true,
+                "deviceLabel": deviceLabel,
+                "deviceBuiltIn": deviceBuiltInPayload(deviceBuiltIn),
+                "maxTouchFramesPerDevice": maxTouchFramesPerDevice,
+                "reason": "per-device raw touch-frame cap reached; derived gesture events continue"
+            ])
         }
-        events.append(framePayload)
 
         for update in updates {
             var payload = update.payload
             payload["timestamp"] = isoTimestamp()
             payload["source"] = "private-multitouch"
             payload["usesPrivateAPI"] = true
+            payload["deviceLabel"] = deviceLabel
+            payload["deviceBuiltIn"] = deviceBuiltInPayload(deviceBuiltIn)
             payload["pointerLocation"] = pointPayload(pointerLocation)
             payload["modifierFlags"] = modifierFlags
             if let axPayload {
@@ -669,22 +759,26 @@ final class PrivateMultitouchProbe {
     }
 
     private func deviceMetadata(device: MTDeviceRef, index: Int) -> [String: Any] {
+        let label = sessionDeviceLabel(for: device)
         var payload: [String: Any] = [
             "index": index,
-            "pointer": String(UInt(bitPattern: device), radix: 16)
+            "label": label
         ]
 
         if let deviceIsBuiltIn {
-            payload["builtIn"] = deviceIsBuiltIn(device)
+            let builtIn = deviceIsBuiltIn(device)
+            payload["builtIn"] = builtIn
+            deviceBuiltInByLabel[label] = builtIn
+        } else {
+            payload["builtIn"] = "unavailable"
+            deviceBuiltInByLabel[label] = nil
         }
 
         if let deviceGetDeviceID {
             var deviceID: UInt64 = 0
             let result = deviceGetDeviceID(device, &deviceID)
             payload["deviceIDResult"] = result
-            if result == 0 {
-                payload["deviceID"] = String(deviceID)
-            }
+            payload["deviceID"] = result == 0 ? "redacted" : "unavailable"
         }
 
         if let deviceGetSensorSurfaceDimensions {
@@ -701,6 +795,31 @@ final class PrivateMultitouchProbe {
         }
 
         return payload
+    }
+
+    private func sessionDeviceLabel(for device: MTDeviceRef?) -> String {
+        guard let device else {
+            return "unknown-device"
+        }
+
+        let key = UInt(bitPattern: device)
+        if let existing = deviceLabelsByPointer[key] {
+            return existing
+        }
+
+        let label = "multitouch-\(deviceLabelsByPointer.count + 1)"
+        deviceLabelsByPointer[key] = label
+        return label
+    }
+
+    private func shouldEmitTouchFrame(for deviceLabel: String) -> Bool {
+        let count = emittedTouchFrameCountsByLabel[deviceLabel] ?? 0
+        guard count < maxTouchFramesPerDevice else {
+            return false
+        }
+
+        emittedTouchFrameCountsByLabel[deviceLabel] = count + 1
+        return true
     }
 }
 
@@ -1039,6 +1158,10 @@ private func pointPayload(_ point: CGPoint) -> [String: Double] {
 private func rounded(_ value: Double, places: Double = 6) -> Double {
     let scale = pow(10, places)
     return (value * scale).rounded() / scale
+}
+
+private func deviceBuiltInPayload(_ isBuiltIn: Bool?) -> Any {
+    isBuiltIn ?? "unavailable"
 }
 
 private func activeDisplayPayload() -> [[String: Any]] {
