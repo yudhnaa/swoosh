@@ -64,6 +64,8 @@ public struct PrivateCaptureDiagnostics: Equatable, Sendable {
     public var frameworkAvailable: Bool
     public var requiredSymbolsAvailable: Bool
     public var deviceCount: Int
+    public var startedDeviceCount: Int
+    public var failedDeviceCount: Int
     public var started: Bool
     public var reason: String
 
@@ -71,12 +73,16 @@ public struct PrivateCaptureDiagnostics: Equatable, Sendable {
         frameworkAvailable: Bool,
         requiredSymbolsAvailable: Bool,
         deviceCount: Int,
+        startedDeviceCount: Int = 0,
+        failedDeviceCount: Int = 0,
         started: Bool,
         reason: String
     ) {
         self.frameworkAvailable = frameworkAvailable
         self.requiredSymbolsAvailable = requiredSymbolsAvailable
         self.deviceCount = deviceCount
+        self.startedDeviceCount = startedDeviceCount
+        self.failedDeviceCount = failedDeviceCount
         self.started = started
         self.reason = reason
     }

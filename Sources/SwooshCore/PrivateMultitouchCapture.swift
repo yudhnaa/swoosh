@@ -9,12 +9,35 @@ public enum GestureCaptureSourceStatus: Equatable, Sendable {
     case failed(PrivateCaptureDiagnostics)
 }
 
+public struct CapturedGestureSource: Equatable, Hashable, Sendable {
+    public var deviceID: String
+    public var generation: Int
+
+    public init(deviceID: String, generation: Int) {
+        self.deviceID = deviceID
+        self.generation = generation
+    }
+
+    public static let unspecified = CapturedGestureSource(deviceID: "unspecified", generation: 0)
+
+    public var isSpecified: Bool {
+        self != .unspecified
+    }
+}
+
 public struct CapturedGestureStart: Equatable, Sendable {
+    public var source: CapturedGestureSource
     public var pointer: ScreenPoint
     public var modifiers: Set<ModifierRole>
     public var timestampMilliseconds: Int
 
-    public init(pointer: ScreenPoint, modifiers: Set<ModifierRole>, timestampMilliseconds: Int) {
+    public init(
+        source: CapturedGestureSource = .unspecified,
+        pointer: ScreenPoint,
+        modifiers: Set<ModifierRole>,
+        timestampMilliseconds: Int
+    ) {
+        self.source = source
         self.pointer = pointer
         self.modifiers = modifiers
         self.timestampMilliseconds = timestampMilliseconds
@@ -22,6 +45,7 @@ public struct CapturedGestureStart: Equatable, Sendable {
 }
 
 public struct CapturedGestureStroke: Equatable, Sendable {
+    public var source: CapturedGestureSource
     public var direction: GestureDirection
     public var pointer: ScreenPoint
     public var modifiers: Set<ModifierRole>
@@ -29,12 +53,14 @@ public struct CapturedGestureStroke: Equatable, Sendable {
     public var eventID: String
 
     public init(
+        source: CapturedGestureSource = .unspecified,
         direction: GestureDirection,
         pointer: ScreenPoint,
         modifiers: Set<ModifierRole>,
         timestampMilliseconds: Int,
         eventID: String
     ) {
+        self.source = source
         self.direction = direction
         self.pointer = pointer
         self.modifiers = modifiers
@@ -44,6 +70,7 @@ public struct CapturedGestureStroke: Equatable, Sendable {
 }
 
 public struct CapturedGesturePinch: Equatable, Sendable {
+    public var source: CapturedGestureSource
     public var direction: GesturePinchDirection
     public var pointer: ScreenPoint
     public var modifiers: Set<ModifierRole>
@@ -52,6 +79,7 @@ public struct CapturedGesturePinch: Equatable, Sendable {
     public var isCancelled: Bool
 
     public init(
+        source: CapturedGestureSource = .unspecified,
         direction: GesturePinchDirection,
         pointer: ScreenPoint,
         modifiers: Set<ModifierRole>,
@@ -59,6 +87,7 @@ public struct CapturedGesturePinch: Equatable, Sendable {
         eventID: String,
         isCancelled: Bool = false
     ) {
+        self.source = source
         self.direction = direction
         self.pointer = pointer
         self.modifiers = modifiers
@@ -69,17 +98,20 @@ public struct CapturedGesturePinch: Equatable, Sendable {
 }
 
 public struct CapturedGestureTap: Equatable, Sendable {
+    public var source: CapturedGestureSource
     public var pointer: ScreenPoint
     public var modifiers: Set<ModifierRole>
     public var timestampMilliseconds: Int
     public var eventID: String
 
     public init(
+        source: CapturedGestureSource = .unspecified,
         pointer: ScreenPoint,
         modifiers: Set<ModifierRole>,
         timestampMilliseconds: Int,
         eventID: String
     ) {
+        self.source = source
         self.pointer = pointer
         self.modifiers = modifiers
         self.timestampMilliseconds = timestampMilliseconds
@@ -93,17 +125,20 @@ public enum CapturedGestureProgressKind: Equatable, Sendable {
 }
 
 public struct CapturedGestureProgress: Equatable, Sendable {
+    public var source: CapturedGestureSource
     public var kind: CapturedGestureProgressKind
     public var pointer: ScreenPoint
     public var modifiers: Set<ModifierRole>
     public var timestampMilliseconds: Int
 
     public init(
+        source: CapturedGestureSource = .unspecified,
         kind: CapturedGestureProgressKind,
         pointer: ScreenPoint,
         modifiers: Set<ModifierRole>,
         timestampMilliseconds: Int
     ) {
+        self.source = source
         self.kind = kind
         self.pointer = pointer
         self.modifiers = modifiers
@@ -111,34 +146,141 @@ public struct CapturedGestureProgress: Equatable, Sendable {
     }
 }
 
+public struct CapturedGestureMovement: Equatable, Sendable {
+    public var source: CapturedGestureSource
+    public var timestampMilliseconds: Int
+
+    public init(source: CapturedGestureSource = .unspecified, timestampMilliseconds: Int) {
+        self.source = source
+        self.timestampMilliseconds = timestampMilliseconds
+    }
+}
+
+public struct CapturedGestureEnd: Equatable, Sendable {
+    public var source: CapturedGestureSource
+    public var timestampMilliseconds: Int
+
+    public init(source: CapturedGestureSource = .unspecified, timestampMilliseconds: Int) {
+        self.source = source
+        self.timestampMilliseconds = timestampMilliseconds
+    }
+}
+
+public struct CapturedGestureCancellation: Equatable, Sendable {
+    public var source: CapturedGestureSource
+    public var reason: GestureCancelReason
+    public var timestampMilliseconds: Int
+
+    public init(
+        source: CapturedGestureSource = .unspecified,
+        reason: GestureCancelReason,
+        timestampMilliseconds: Int
+    ) {
+        self.source = source
+        self.reason = reason
+        self.timestampMilliseconds = timestampMilliseconds
+    }
+}
+
 public enum CapturedGestureEvent: Equatable, Sendable {
     case began(CapturedGestureStart)
     case movement(timestampMilliseconds: Int)
+    case deviceMovement(CapturedGestureMovement)
     case changed(CapturedGestureProgress)
     case strokeEnded(CapturedGestureStroke)
     case pinchEnded(CapturedGesturePinch)
     case tapEnded(CapturedGestureTap)
     case ended(timestampMilliseconds: Int)
+    case deviceEnded(CapturedGestureEnd)
     case cancelled(GestureCancelReason, timestampMilliseconds: Int)
+    case deviceCancelled(CapturedGestureCancellation)
+
+    public var source: CapturedGestureSource {
+        switch self {
+        case .began(let start):
+            start.source
+        case .movement:
+            .unspecified
+        case .deviceMovement(let movement):
+            movement.source
+        case .changed(let progress):
+            progress.source
+        case .strokeEnded(let stroke):
+            stroke.source
+        case .pinchEnded(let pinch):
+            pinch.source
+        case .tapEnded(let tap):
+            tap.source
+        case .ended:
+            .unspecified
+        case .deviceEnded(let end):
+            end.source
+        case .cancelled:
+            .unspecified
+        case .deviceCancelled(let cancellation):
+            cancellation.source
+        }
+    }
+
+    public var timestampMilliseconds: Int {
+        switch self {
+        case .began(let start):
+            start.timestampMilliseconds
+        case .movement(let timestampMilliseconds):
+            timestampMilliseconds
+        case .deviceMovement(let movement):
+            movement.timestampMilliseconds
+        case .changed(let progress):
+            progress.timestampMilliseconds
+        case .strokeEnded(let stroke):
+            stroke.timestampMilliseconds
+        case .pinchEnded(let pinch):
+            pinch.timestampMilliseconds
+        case .tapEnded(let tap):
+            tap.timestampMilliseconds
+        case .ended(let timestampMilliseconds):
+            timestampMilliseconds
+        case .deviceEnded(let end):
+            end.timestampMilliseconds
+        case .cancelled(_, let timestampMilliseconds):
+            timestampMilliseconds
+        case .deviceCancelled(let cancellation):
+            cancellation.timestampMilliseconds
+        }
+    }
 }
 
 public protocol GestureCaptureSource: AnyObject {
     var status: GestureCaptureSourceStatus { get }
+    var currentGeneration: Int { get }
     func start(handler: @escaping @Sendable (CapturedGestureEvent) -> Void) -> GestureCaptureSourceStatus
+    func refreshDevices() -> GestureCaptureSourceStatus
     func stop()
+}
+
+public extension GestureCaptureSource {
+    var currentGeneration: Int { 0 }
+
+    func refreshDevices() -> GestureCaptureSourceStatus {
+        status
+    }
 }
 
 public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
     private static let frameworkPath = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
 
     private var handle: UnsafeMutableRawPointer?
-    private var devices: [MTDeviceRef] = []
-    private var recognizer: BuiltInTrackpadGestureRecognizer
+    private var devices: [RegisteredMTDevice] = []
+    private var callbackContexts: [PrivateMultitouchDeviceCallbackContext] = []
+    private var retiredCallbackContexts: [PrivateMultitouchDeviceCallbackContext] = []
+    private var router = MultitouchCaptureEventRouter()
     private let settingsProvider: () -> SwooshSettings
     private let pointerProvider: () -> ScreenPoint
     private let modifierProvider: () -> Set<ModifierRole>
     private let lock = NSLock()
     private var handler: (@Sendable (CapturedGestureEvent) -> Void)?
+    private var generation = 0
+    private var nextDeviceOrdinal = 0
 
     private var createList: MTDeviceCreateListFn?
     private var registerWithRefcon: MTRegisterContactFrameCallbackWithRefconFn?
@@ -149,6 +291,9 @@ public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
     private var deviceGetDeviceID: MTDeviceGetDeviceIDFn?
 
     public private(set) var status: GestureCaptureSourceStatus = .stopped
+    public var currentGeneration: Int {
+        generation
+    }
 
     public init(
         settingsProvider: @escaping () -> SwooshSettings = { .defaults },
@@ -163,7 +308,6 @@ public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
         self.settingsProvider = settingsProvider
         self.pointerProvider = pointerProvider
         self.modifierProvider = modifierProvider
-        recognizer = BuiltInTrackpadGestureRecognizer(settings: settingsProvider())
     }
 
     deinit {
@@ -176,8 +320,10 @@ public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
     @discardableResult
     public func start(handler: @escaping @Sendable (CapturedGestureEvent) -> Void) -> GestureCaptureSourceStatus {
         stopDevices()
-        recognizer = BuiltInTrackpadGestureRecognizer(settings: settingsProvider())
+        generation += 1
+        router.reset()
         self.handler = handler
+        let settings = settingsProvider()
 
         guard loadFramework() else {
             let diagnostics = PrivateCaptureDiagnostics(
@@ -215,21 +361,18 @@ public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
             return status
         }
 
-        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         let count = CFArrayGetCount(deviceArray)
+        var failedStarts = 0
         for index in 0..<count {
             guard let rawDevice = CFArrayGetValueAtIndex(deviceArray, index) else {
                 continue
             }
 
             let device = UnsafeMutableRawPointer(mutating: rawDevice)
-            if let deviceIsBuiltIn, !deviceIsBuiltIn(device) {
-                continue
-            }
-
-            registerCallback(device, PrivateMultitouchCaptureBridge.callbackWithRefcon, refcon)
-            if deviceStart(device, 0) == 0 {
-                devices.append(device)
+            let key = deviceKey(for: device)
+            if startDevice(device, key: key, settings: settings, registerCallback: registerCallback, deviceStart: deviceStart) {
+            } else {
+                failedStarts += 1
             }
         }
 
@@ -237,8 +380,75 @@ public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
             frameworkAvailable: true,
             requiredSymbolsAvailable: true,
             deviceCount: count,
+            startedDeviceCount: devices.count,
+            failedDeviceCount: failedStarts,
             started: !devices.isEmpty,
-            reason: devices.isEmpty ? "No built-in multitouch device could be started." : "Built-in multitouch capture is running."
+            reason: Self.captureReason(deviceCount: count, startedCount: devices.count, failedCount: failedStarts)
+        )
+        status = devices.isEmpty ? .failed(diagnostics) : .running(diagnostics)
+        return status
+    }
+
+    @discardableResult
+    public func refreshDevices() -> GestureCaptureSourceStatus {
+        guard handler != nil else {
+            return status
+        }
+
+        guard loadFramework(),
+              let createList,
+              let deviceStart,
+              let deviceStop,
+              let registerCallback = registerWithRefcon,
+              let deviceArray = createList()?.takeUnretainedValue()
+        else {
+            return status
+        }
+
+        let settings = settingsProvider()
+        let enumeratedDevices = (0..<CFArrayGetCount(deviceArray)).compactMap { index -> MTDeviceRef? in
+            guard let rawDevice = CFArrayGetValueAtIndex(deviceArray, index) else {
+                return nil
+            }
+            return UnsafeMutableRawPointer(mutating: rawDevice)
+        }
+        let enumeratedByKey = Dictionary(uniqueKeysWithValues: enumeratedDevices.map { (deviceKey(for: $0), $0) })
+        let enumeratedKeys = Set(enumeratedByKey.keys)
+        let existingKeys = Set(devices.map(\.key))
+        let removedKeys = existingKeys.subtracting(enumeratedKeys)
+        let addedKeys = enumeratedKeys.subtracting(existingKeys)
+
+        var cancellationEvents: [CapturedGestureEvent] = []
+        if !removedKeys.isEmpty {
+            for removed in devices where removedKeys.contains(removed.key) {
+                _ = deviceStop(removed.device)
+                cancellationEvents.append(contentsOf: router.retire(key: removed.key))
+            }
+            devices.removeAll { removedKeys.contains($0.key) }
+        }
+
+        var failedStarts = 0
+        for key in addedKeys.sorted() {
+            guard let device = enumeratedByKey[key],
+                  startDevice(device, key: key, settings: settings, registerCallback: registerCallback, deviceStart: deviceStart)
+            else {
+                failedStarts += 1
+                continue
+            }
+        }
+
+        for event in cancellationEvents {
+            handler?(event)
+        }
+
+        let diagnostics = PrivateCaptureDiagnostics(
+            frameworkAvailable: true,
+            requiredSymbolsAvailable: true,
+            deviceCount: enumeratedDevices.count,
+            startedDeviceCount: devices.count,
+            failedDeviceCount: failedStarts,
+            started: !devices.isEmpty,
+            reason: Self.captureReason(deviceCount: enumeratedDevices.count, startedCount: devices.count, failedCount: failedStarts)
         )
         status = devices.isEmpty ? .failed(diagnostics) : .running(diagnostics)
         return status
@@ -246,30 +456,44 @@ public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
 
     public func stop() {
         stopDevices()
+        generation += 1
         handler = nil
-        recognizer.reset()
+        router.reset()
         status = .stopped
     }
 
-    fileprivate func handleFrame(touches rawPointer: UnsafeRawPointer?, count: Int, timestamp: Double, frame: Int) {
-        guard let rawPointer else {
+    fileprivate func handleFrame(
+        key: String,
+        source: CapturedGestureSource,
+        touches rawPointer: UnsafeRawPointer?,
+        count: Int,
+        timestamp: Double,
+        frame: Int
+    ) {
+        guard count >= 0 else {
             return
         }
 
-        let pointer = rawPointer.assumingMemoryBound(to: MTTouch.self)
         var samples: [PrivateTouchSample] = []
-        samples.reserveCapacity(max(0, count))
-        for index in 0..<max(0, count) {
-            let touch = pointer.advanced(by: index).pointee
-            samples.append(PrivateTouchSample(
-                id: touch.fingerID,
-                state: touch.state,
-                x: Double(touch.normalizedVector.position.x),
-                y: Double(touch.normalizedVector.position.y)
-            ))
+        if count > 0 {
+            guard let rawPointer else {
+                return
+            }
+
+            let pointer = rawPointer.assumingMemoryBound(to: MTTouch.self)
+            samples.reserveCapacity(count)
+            for index in 0..<count {
+                let touch = pointer.advanced(by: index).pointee
+                samples.append(PrivateTouchSample(
+                    id: touch.fingerID,
+                    state: touch.state,
+                    x: Double(touch.normalizedVector.position.x),
+                    y: Double(touch.normalizedVector.position.y)
+                ))
+            }
         }
 
-        let context = CaptureRecognitionContext(
+        let baseContext = CaptureRecognitionContext(
             pointer: pointerProvider(),
             modifiers: modifierProvider(),
             timestampMilliseconds: Self.currentTimestampMilliseconds(),
@@ -277,7 +501,12 @@ public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
         )
 
         lock.lock()
-        let events = recognizer.process(touches: samples, context: context)
+        let events = router.process(
+            key: key,
+            expectedSource: source,
+            touches: samples,
+            context: baseContext
+        )
         lock.unlock()
 
         for event in events {
@@ -306,16 +535,80 @@ public final class PrivateMultitouchCaptureSource: GestureCaptureSource {
     private func stopDevices() {
         guard let deviceStop else {
             devices.removeAll()
+            callbackContexts.removeAll()
+            router.reset()
             return
         }
         for device in devices {
-            _ = deviceStop(device)
+            _ = deviceStop(device.device)
         }
         devices.removeAll()
+        retiredCallbackContexts.append(contentsOf: callbackContexts)
+        if retiredCallbackContexts.count > 64 {
+            retiredCallbackContexts.removeFirst(retiredCallbackContexts.count - 64)
+        }
+        callbackContexts.removeAll()
+        router.reset()
+    }
+
+    private func startDevice(
+        _ device: MTDeviceRef,
+        key: String,
+        settings: SwooshSettings,
+        registerCallback: MTRegisterContactFrameCallbackWithRefconFn,
+        deviceStart: MTDeviceStartFn
+    ) -> Bool {
+        nextDeviceOrdinal += 1
+        let source = CapturedGestureSource(deviceID: "multitouch-\(nextDeviceOrdinal)", generation: generation)
+        let callbackContext = PrivateMultitouchDeviceCallbackContext(
+            capture: self,
+            key: key,
+            source: source
+        )
+        callbackContexts.append(callbackContext)
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(callbackContext).toOpaque())
+        registerCallback(device, PrivateMultitouchCaptureBridge.callbackWithRefcon, refcon)
+        guard deviceStart(device, 0) == 0 else {
+            callbackContexts.removeAll { $0 === callbackContext }
+            retiredCallbackContexts.append(callbackContext)
+            return false
+        }
+
+        devices.append(RegisteredMTDevice(device: device, key: key, source: source))
+        router.register(key: key, source: source, settings: settings)
+        return true
+    }
+
+    private func deviceKey(for device: MTDeviceRef) -> String {
+        var stableDeviceID: UInt64 = 0
+        if let deviceGetDeviceID,
+           deviceGetDeviceID(device, &stableDeviceID) == 0,
+           stableDeviceID != 0 {
+            return "id-\(stableDeviceID)"
+        }
+
+        return "ptr-\(String(UInt(bitPattern: device), radix: 16))"
+    }
+
+    private static func captureReason(deviceCount: Int, startedCount: Int, failedCount: Int) -> String {
+        guard deviceCount > 0 else {
+            return "No multitouch devices were reported."
+        }
+        guard startedCount > 0 else {
+            return "No multitouch device could be started."
+        }
+        if failedCount > 0 {
+            return "Private multitouch capture is running on \(startedCount) device(s); \(failedCount) device(s) failed to start."
+        }
+        return "Private multitouch capture is running on \(startedCount) device(s)."
     }
 
     private static func currentTimestampMilliseconds() -> Int {
         Int((Date().timeIntervalSince1970 * 1_000).rounded())
+    }
+
+    static func currentTimestampMillisecondsForRouting() -> Int {
+        currentTimestampMilliseconds()
     }
 
     public static func currentModifierRoles() -> Set<ModifierRole> {
@@ -347,10 +640,33 @@ extension PrivateMultitouchCaptureSource: LifecycleResource {
 }
 
 struct CaptureRecognitionContext: Equatable, Sendable {
+    var source: CapturedGestureSource
     var pointer: ScreenPoint
     var modifiers: Set<ModifierRole>
     var timestampMilliseconds: Int
     var frame: Int
+
+    init(
+        source: CapturedGestureSource = .unspecified,
+        pointer: ScreenPoint,
+        modifiers: Set<ModifierRole>,
+        timestampMilliseconds: Int,
+        frame: Int
+    ) {
+        self.source = source
+        self.pointer = pointer
+        self.modifiers = modifiers
+        self.timestampMilliseconds = timestampMilliseconds
+        self.frame = frame
+    }
+
+    func eventID(kind: String, parts: String...) -> String {
+        let suffix = ([kind] + parts).joined(separator: "-")
+        guard source.isSpecified else {
+            return suffix
+        }
+        return "\(source.deviceID)-g\(source.generation)-\(suffix)"
+    }
 }
 
 struct PrivateTouchSample: Equatable, Sendable {
@@ -409,7 +725,14 @@ final class BuiltInTrackpadGestureRecognizer {
         guard activeTouches.count == 2 else {
             if activeTouches.count > 2, active {
                 reset()
-                return [.cancelled(.gestureCancelled, timestampMilliseconds: context.timestampMilliseconds)]
+                guard context.source.isSpecified else {
+                    return [.cancelled(.gestureCancelled, timestampMilliseconds: context.timestampMilliseconds)]
+                }
+                return [.deviceCancelled(CapturedGestureCancellation(
+                    source: context.source,
+                    reason: .gestureCancelled,
+                    timestampMilliseconds: context.timestampMilliseconds
+                ))]
             }
             if activeTouches.count > 2 {
                 return []
@@ -431,6 +754,7 @@ final class BuiltInTrackpadGestureRecognizer {
             strokeAnchorCentroid = centroid
             sequence += 1
             return [.began(CapturedGestureStart(
+                source: context.source,
                 pointer: context.pointer,
                 modifiers: context.modifiers,
                 timestampMilliseconds: context.timestampMilliseconds
@@ -442,7 +766,14 @@ final class BuiltInTrackpadGestureRecognizer {
         if moved {
             lastMovementCentroid = centroid
             lastMovementTimestampMilliseconds = context.timestampMilliseconds
-            events.append(.movement(timestampMilliseconds: context.timestampMilliseconds))
+            if context.source.isSpecified {
+                events.append(.deviceMovement(CapturedGestureMovement(
+                    source: context.source,
+                    timestampMilliseconds: context.timestampMilliseconds
+                )))
+            } else {
+                events.append(.movement(timestampMilliseconds: context.timestampMilliseconds))
+            }
         }
 
         lastCentroid = centroid
@@ -497,23 +828,33 @@ final class BuiltInTrackpadGestureRecognizer {
 
         if let pendingPinchDirection {
             return [.pinchEnded(CapturedGesturePinch(
+                source: context.source,
                 direction: pendingPinchDirection,
                 pointer: context.pointer,
                 modifiers: context.modifiers,
                 timestampMilliseconds: context.timestampMilliseconds,
-                eventID: "pinch-\(sequence)-\(context.frame)"
+                eventID: context.eventID(kind: "pinch", parts: "\(sequence)", "\(context.frame)")
             ))]
         }
 
         if let pendingStrokeDirection {
+            let ended: CapturedGestureEvent = context.source.isSpecified
+                ? .deviceEnded(CapturedGestureEnd(source: context.source, timestampMilliseconds: context.timestampMilliseconds))
+                : .ended(timestampMilliseconds: context.timestampMilliseconds)
             return [
                 strokeEvent(direction: pendingStrokeDirection, context: context),
-                .ended(timestampMilliseconds: context.timestampMilliseconds)
+                ended
             ]
         }
 
         if segment > 0 {
-            return [.ended(timestampMilliseconds: context.timestampMilliseconds)]
+            guard context.source.isSpecified else {
+                return [.ended(timestampMilliseconds: context.timestampMilliseconds)]
+            }
+            return [.deviceEnded(CapturedGestureEnd(
+                source: context.source,
+                timestampMilliseconds: context.timestampMilliseconds
+            ))]
         }
 
         let dx = last.x - base.x
@@ -527,20 +868,22 @@ final class BuiltInTrackpadGestureRecognizer {
         if isPinchDominant {
             let pinchDirection: GesturePinchDirection = spreadDelta < 0 ? .inward : .outward
             return [.pinchEnded(CapturedGesturePinch(
+                source: context.source,
                 direction: pinchDirection,
                 pointer: context.pointer,
                 modifiers: context.modifiers,
                 timestampMilliseconds: context.timestampMilliseconds,
-                eventID: "pinch-\(sequence)-\(context.frame)"
+                eventID: context.eventID(kind: "pinch", parts: "\(sequence)", "\(context.frame)")
             ))]
         }
 
         guard travel >= swipeThreshold else {
             return [.tapEnded(CapturedGestureTap(
+                source: context.source,
                 pointer: context.pointer,
                 modifiers: context.modifiers,
                 timestampMilliseconds: context.timestampMilliseconds,
-                eventID: "tap-\(sequence)-\(context.frame)"
+                eventID: context.eventID(kind: "tap", parts: "\(sequence)", "\(context.frame)")
             ))]
         }
 
@@ -551,9 +894,12 @@ final class BuiltInTrackpadGestureRecognizer {
             direction = dy < 0 ? .down : .up
         }
 
+        let ended: CapturedGestureEvent = context.source.isSpecified
+            ? .deviceEnded(CapturedGestureEnd(source: context.source, timestampMilliseconds: context.timestampMilliseconds))
+            : .ended(timestampMilliseconds: context.timestampMilliseconds)
         return [
             strokeEvent(direction: direction, context: context),
-            .ended(timestampMilliseconds: context.timestampMilliseconds)
+            ended
         ]
     }
 
@@ -577,6 +923,7 @@ final class BuiltInTrackpadGestureRecognizer {
         if isPinchDominant {
             let direction: GesturePinchDirection = spreadDelta < 0 ? .inward : .outward
             return .changed(CapturedGestureProgress(
+                source: context.source,
                 kind: .pinch(direction),
                 pointer: context.pointer,
                 modifiers: context.modifiers,
@@ -596,6 +943,7 @@ final class BuiltInTrackpadGestureRecognizer {
         }
 
         return .changed(CapturedGestureProgress(
+            source: context.source,
             kind: .stroke(direction),
             pointer: context.pointer,
             modifiers: context.modifiers,
@@ -606,11 +954,12 @@ final class BuiltInTrackpadGestureRecognizer {
     private func strokeEvent(direction: GestureDirection, context: CaptureRecognitionContext) -> CapturedGestureEvent {
         segment += 1
         return .strokeEnded(CapturedGestureStroke(
+            source: context.source,
             direction: direction,
             pointer: context.pointer,
             modifiers: context.modifiers,
             timestampMilliseconds: context.timestampMilliseconds,
-            eventID: "stroke-\(sequence)-\(segment)-\(context.frame)"
+            eventID: context.eventID(kind: "stroke", parts: "\(sequence)", "\(segment)", "\(context.frame)")
         ))
     }
 
@@ -655,6 +1004,80 @@ final class BuiltInTrackpadGestureRecognizer {
 }
 
 private typealias MTDeviceRef = UnsafeMutableRawPointer
+
+private struct RegisteredMTDevice {
+    var device: MTDeviceRef
+    var key: String
+    var source: CapturedGestureSource
+}
+
+private final class PrivateMultitouchDeviceCallbackContext {
+    weak var capture: PrivateMultitouchCaptureSource?
+    var key: String
+    var source: CapturedGestureSource
+
+    init(capture: PrivateMultitouchCaptureSource, key: String, source: CapturedGestureSource) {
+        self.capture = capture
+        self.key = key
+        self.source = source
+    }
+}
+
+final class MultitouchCaptureEventRouter {
+    private var devices: [String: RoutedCaptureDevice] = [:]
+
+    func register(key: String, source: CapturedGestureSource, settings: SwooshSettings = .defaults) {
+        devices[key] = RoutedCaptureDevice(
+            source: source,
+            recognizer: BuiltInTrackpadGestureRecognizer(settings: settings)
+        )
+    }
+
+    func reset() {
+        devices.removeAll()
+    }
+
+    func retire(key: String) -> [CapturedGestureEvent] {
+        guard let device = devices.removeValue(forKey: key) else {
+            return []
+        }
+
+        return [.deviceCancelled(CapturedGestureCancellation(
+            source: device.source,
+            reason: .captureFailed,
+            timestampMilliseconds: PrivateMultitouchCaptureSource.currentTimestampMillisecondsForRouting()
+        ))]
+    }
+
+    func process(
+        key: String,
+        expectedSource: CapturedGestureSource? = nil,
+        touches: [PrivateTouchSample],
+        context: CaptureRecognitionContext
+    ) -> [CapturedGestureEvent] {
+        guard let device = devices[key],
+              expectedSource == nil || device.source == expectedSource,
+              device.source.generation == context.source.generation || context.source == .unspecified
+        else {
+            return []
+        }
+
+        let sourcedContext = CaptureRecognitionContext(
+            source: device.source,
+            pointer: context.pointer,
+            modifiers: context.modifiers,
+            timestampMilliseconds: context.timestampMilliseconds,
+            frame: context.frame
+        )
+        let events = device.recognizer.process(touches: touches, context: sourcedContext)
+        return events
+    }
+}
+
+private struct RoutedCaptureDevice {
+    var source: CapturedGestureSource
+    var recognizer: BuiltInTrackpadGestureRecognizer
+}
 
 private struct MTPoint {
     var x: Float
@@ -719,8 +1142,15 @@ private enum PrivateMultitouchCaptureBridge {
         guard let refcon else {
             return
         }
-        let capture = Unmanaged<PrivateMultitouchCaptureSource>.fromOpaque(refcon).takeUnretainedValue()
-        capture.handleFrame(touches: touches, count: count, timestamp: timestamp, frame: frame)
+        let context = Unmanaged<PrivateMultitouchDeviceCallbackContext>.fromOpaque(refcon).takeUnretainedValue()
+        context.capture?.handleFrame(
+            key: context.key,
+            source: context.source,
+            touches: touches,
+            count: count,
+            timestamp: timestamp,
+            frame: frame
+        )
     }
 }
 

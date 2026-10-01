@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import IOKit
 import ServiceManagement
 import SwooshCore
 import SwiftUI
@@ -85,6 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     fileprivate var statusController: StatusMenuController?
     private var settingsWindowController: SettingsWindowController?
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var captureDeviceObserver: CaptureDeviceChangeObserver?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(model.settings.showInDock ? .regular : .accessory)
@@ -100,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lifecycle.register(shortcutCoordinator)
         lifecycle.register(gestureController)
         installWorkspaceObservers()
+        installCaptureDeviceObserver()
         statusController = StatusMenuController(model: model, lifecycle: lifecycle) { [weak self] in
             self?.openSettings()
         }
@@ -115,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        removeCaptureDeviceObserver()
         removeWorkspaceObservers()
         lifecycle.shutdownAll()
     }
@@ -147,12 +151,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         workspaceObservers.removeAll()
     }
 
+    private func installCaptureDeviceObserver() {
+        let observer = CaptureDeviceChangeObserver { [weak self] in
+            self?.gestureController.captureDevicesDidChange()
+        }
+        observer.start()
+        captureDeviceObserver = observer
+    }
+
+    private func removeCaptureDeviceObserver() {
+        captureDeviceObserver?.stop()
+        captureDeviceObserver = nil
+    }
+
     private func openSettings() {
         settingsWindowController?.show()
     }
 
     private func handleKeyboardCommand(_ command: KeyboardCommand) {
         model.handleKeyboardCommand(command)
+    }
+}
+
+@MainActor
+private final class CaptureDeviceChangeObserver {
+    private var notificationPort: IONotificationPortRef?
+    private var addedIterator: io_iterator_t = 0
+    private var removedIterator: io_iterator_t = 0
+    private let onChange: () -> Void
+
+    init(onChange: @escaping () -> Void) {
+        self.onChange = onChange
+    }
+
+    func start() {
+        guard notificationPort == nil else {
+            return
+        }
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else {
+            return
+        }
+
+        notificationPort = port
+        if let source = IONotificationPortGetRunLoopSource(port) {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source.takeUnretainedValue(), .defaultMode)
+        }
+
+        installNotification(named: kIOFirstMatchNotification, iterator: &addedIterator)
+        installNotification(named: kIOTerminatedNotification, iterator: &removedIterator)
+    }
+
+    func stop() {
+        if addedIterator != 0 {
+            IOObjectRelease(addedIterator)
+            addedIterator = 0
+        }
+        if removedIterator != 0 {
+            IOObjectRelease(removedIterator)
+            removedIterator = 0
+        }
+        if let notificationPort {
+            if let source = IONotificationPortGetRunLoopSource(notificationPort) {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), source.takeUnretainedValue(), .defaultMode)
+            }
+            IONotificationPortDestroy(notificationPort)
+            self.notificationPort = nil
+        }
+    }
+
+    private func installNotification(named name: UnsafePointer<CChar>, iterator: UnsafeMutablePointer<io_iterator_t>) {
+        guard let notificationPort,
+              let matching = IOServiceMatching("IOHIDDevice")
+        else {
+            return
+        }
+
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        let result = IOServiceAddMatchingNotification(
+            notificationPort,
+            name,
+            matching,
+            Self.deviceChanged,
+            refcon,
+            iterator
+        )
+        guard result == KERN_SUCCESS else {
+            iterator.pointee = 0
+            return
+        }
+        Self.drain(iterator.pointee)
+    }
+
+    private func handleDeviceChanged() {
+        onChange()
+    }
+
+    private nonisolated static let deviceChanged: IOServiceMatchingCallback = { refcon, iterator in
+        drain(iterator)
+        guard let refcon else {
+            return
+        }
+        let observer = Unmanaged<CaptureDeviceChangeObserver>.fromOpaque(refcon).takeUnretainedValue()
+        Task { @MainActor in
+            observer.handleDeviceChanged()
+        }
+    }
+
+    private nonisolated static func drain(_ iterator: io_iterator_t) {
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            IOObjectRelease(service)
+            service = IOIteratorNext(iterator)
+        }
     }
 }
 
@@ -501,7 +611,17 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
     private var idleDiscardGeneration = 0
     private var suppressActiveGestureUntilRelease = false
     private let previewLatencyTracker = GesturePreviewLatencyTracker()
+    private let captureOwnership = CaptureEventOwnershipGate()
     private let restoreDoubleTapWindowMilliseconds = 450
+    private var expectedCaptureDeviceCount = 0
+    private var captureRefreshGeneration = 0
+    private var captureRefreshScheduled = false
+    private var captureRecoveryAttempt = 0
+    private var lastCaptureDeviceCount = 0
+    private var lastStartedCaptureDeviceCount = 0
+    private let captureDeviceChangeDebounceMilliseconds = 350
+    private let captureRecoveryRetryMilliseconds = 1_000
+    private let maximumCaptureRecoveryAttempts = 12
 
     init(
         capture: GestureCaptureSource,
@@ -532,18 +652,26 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         coordinator.updateSettings(self.settings)
         timeoutGeneration += 1
         idleDiscardGeneration += 1
+        captureRefreshGeneration += 1
+        captureRefreshScheduled = false
+        captureRecoveryAttempt = 0
         previewLatencyTracker.reset()
+        captureOwnership.reset()
         resetActiveGestureState()
         onPreviewEnded()
 
         let permissionReady = permissions.accessibilityTrusted && permissions.inputMonitoringTrusted
         let captureReady = permissions.privateMultitouch.isUsable
+        expectedCaptureDeviceCount = max(expectedCaptureDeviceCount, permissions.privateMultitouch.deviceCount)
         coordinator.start(permissionReady: permissionReady, captureReady: captureReady)
         updateDebug("startup permissions=\(permissionReady ? "ready" : "missing") capturePrereq=\(captureReady ? "available" : "unavailable")")
         publishStatus()
 
         guard self.settings.gesturesEnabled, !self.settings.isPaused, permissionReady, captureReady else {
             capture.stop()
+            captureRefreshGeneration += 1
+            captureRefreshScheduled = false
+            captureRecoveryAttempt = 0
             updateDebug("capture stopped: gestures=\(self.settings.gesturesEnabled) paused=\(self.settings.isPaused) permissions=\(permissionReady) prereq=\(captureReady)")
             return
         }
@@ -554,9 +682,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             }
         }) {
         case .running(let diagnostics):
-            onCaptureDiagnostics(diagnostics)
-            updateDebug("capture running: devices=\(diagnostics.deviceCount) started=\(diagnostics.started)")
-            publishStatus()
+            handleCaptureRunning(diagnostics, context: "capture running")
         case .failed(let diagnostics):
             onCaptureDiagnostics(diagnostics)
             coordinator.listenerFailed()
@@ -568,10 +694,19 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         }
     }
 
+    func captureDevicesDidChange() {
+        captureRecoveryAttempt = 0
+        scheduleCaptureDeviceRefresh(reason: "device change")
+    }
+
     func shutdown() {
         timeoutGeneration += 1
         idleDiscardGeneration += 1
+        captureRefreshGeneration += 1
+        captureRefreshScheduled = false
+        captureRecoveryAttempt = 0
         previewLatencyTracker.reset()
+        captureOwnership.reset()
         resetActiveGestureState()
         onPreviewEnded()
         _ = coordinator.cancel(.paused, at: timestampMilliseconds())
@@ -584,7 +719,11 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
     func suspendForSystemSleep() {
         timeoutGeneration += 1
         idleDiscardGeneration += 1
+        captureRefreshGeneration += 1
+        captureRefreshScheduled = false
+        captureRecoveryAttempt = 0
         previewLatencyTracker.reset()
+        captureOwnership.reset()
         resetActiveGestureState()
         onPreviewEnded()
         _ = coordinator.cancel(.gestureCancelled, at: timestampMilliseconds())
@@ -593,8 +732,106 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         publishStatus()
     }
 
+    private func handleCaptureRunning(
+        _ diagnostics: PrivateCaptureDiagnostics,
+        context: String,
+        forceDebug: Bool = true
+    ) {
+        expectedCaptureDeviceCount = max(
+            expectedCaptureDeviceCount,
+            diagnostics.deviceCount,
+            diagnostics.startedDeviceCount
+        )
+        let deviceCountsChanged = diagnostics.deviceCount != lastCaptureDeviceCount ||
+            diagnostics.startedDeviceCount != lastStartedCaptureDeviceCount
+        lastCaptureDeviceCount = diagnostics.deviceCount
+        lastStartedCaptureDeviceCount = diagnostics.startedDeviceCount
+        let startedSummary = diagnostics.startedDeviceCount > 0
+            ? "\(diagnostics.startedDeviceCount)/\(max(diagnostics.deviceCount, diagnostics.startedDeviceCount))"
+            : "\(diagnostics.started)"
+        onCaptureDiagnostics(diagnostics)
+        if forceDebug || deviceCountsChanged || diagnostics.startedDeviceCount < expectedCaptureDeviceCount {
+            updateDebug("\(context): devices=\(diagnostics.deviceCount) started=\(startedSummary)")
+            publishStatus()
+        }
+        if diagnostics.startedDeviceCount >= expectedCaptureDeviceCount {
+            captureRecoveryAttempt = 0
+        } else if context.hasPrefix("capture refresh") {
+            scheduleCaptureRecoveryIfNeeded()
+        }
+    }
+
+    private func scheduleCaptureRecoveryIfNeeded() {
+        guard lastStartedCaptureDeviceCount < expectedCaptureDeviceCount else {
+            captureRecoveryAttempt = 0
+            return
+        }
+
+        guard captureRecoveryAttempt < maximumCaptureRecoveryAttempts else {
+            updateDebug("capture recovery waiting for device change: devices=\(lastCaptureDeviceCount) expected=\(expectedCaptureDeviceCount)")
+            publishStatus()
+            return
+        }
+
+        captureRecoveryAttempt += 1
+        scheduleCaptureDeviceRefresh(
+            reason: "device recovery \(captureRecoveryAttempt)/\(maximumCaptureRecoveryAttempts)",
+            delayMilliseconds: captureRecoveryRetryMilliseconds
+        )
+    }
+
+    private func scheduleCaptureDeviceRefresh(
+        reason: String,
+        delayMilliseconds: Int? = nil
+    ) {
+        guard settings.gesturesEnabled,
+              !settings.isPaused,
+              !captureRefreshScheduled
+        else {
+            return
+        }
+
+        captureRefreshScheduled = true
+        let generation = captureRefreshGeneration
+        let delay = delayMilliseconds ?? captureDeviceChangeDebounceMilliseconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+            guard let self,
+                  self.captureRefreshGeneration == generation,
+                  self.settings.gesturesEnabled,
+                  !self.settings.isPaused
+            else {
+                return
+            }
+
+            self.captureRefreshScheduled = false
+            switch self.capture.refreshDevices() {
+            case .running(let refreshed):
+                self.handleCaptureRunning(refreshed, context: "capture refresh: \(reason)", forceDebug: false)
+            case .failed(let refreshed):
+                self.onCaptureDiagnostics(refreshed)
+                self.coordinator.listenerFailed()
+                self.updateDebug("capture refresh failed after \(reason): \(refreshed.reason)")
+                self.publishStatus()
+            case .stopped:
+                self.updateDebug("capture refresh after \(reason): stopped")
+                self.publishStatus()
+            }
+        }
+    }
+
     private func handle(_ event: CapturedGestureEvent) {
         capturedEventCount += 1
+        if event.source.isSpecified, event.source.generation != capture.currentGeneration {
+            updateDebug("ignored stale capture event from \(event.source.deviceID)")
+            publishStatus()
+            return
+        }
+        guard captureOwnership.shouldAccept(event) else {
+            updateDebug("ignored competing capture event from \(event.source.deviceID)")
+            publishStatus()
+            return
+        }
+
         switch event {
         case .began(let start):
             timeoutGeneration += 1
@@ -626,13 +863,10 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             }
 
         case .movement(let timestampMilliseconds):
-            guard !suppressActiveGestureUntilRelease else {
-                return
-            }
-            guard !cancelForTopologyChangeIfNeeded(at: timestampMilliseconds) else {
-                return
-            }
-            scheduleIdleDiscard(at: timestampMilliseconds)
+            handleMovement(at: timestampMilliseconds)
+
+        case .deviceMovement(let movement):
+            handleMovement(at: movement.timestampMilliseconds)
 
         case .changed(let progress):
             guard !suppressActiveGestureUntilRelease else {
@@ -644,118 +878,159 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             presentLivePreview(for: progress)
 
         case .strokeEnded(let stroke):
-            if suppressActiveGestureUntilRelease {
-                suppressActiveGestureUntilRelease = false
-                updateDebug("stroke \(stroke.direction.rawValue): ignored after idle discard")
-                publishStatus()
-                return
-            }
-            pendingRestoreTap = nil
-            guard !cancelForTopologyChangeIfNeeded(at: stroke.timestampMilliseconds) else {
-                return
-            }
-            if !resolverSessionActive {
-                beginResolverSession(
-                    pointer: stroke.pointer,
-                    modifiers: stroke.modifiers,
-                    timestampMilliseconds: stroke.timestampMilliseconds,
-                    debugPrefix: "late stroke begin"
-                )
-            }
-            let result = route(.strokeEnded(GestureStroke(
-                direction: stroke.direction,
-                timestampMilliseconds: stroke.timestampMilliseconds,
-                eventID: stroke.eventID,
-                modifiers: stroke.modifiers
-            )), actionID: stroke.eventID)
-            switch result.resolverOutput.kind {
-            case .preview:
-                resolverSessionActive = true
-                stagedStrokeDirections.append(stroke.direction)
-                lastPresentedPreviewLabel = nil
-                updateDebug("stroke \(stroke.direction.rawValue): preview \(result.resolverOutput.intent?.command.displayName ?? "unknown")")
-            case .commit, .cancel, .passThrough:
-                onPreviewEnded()
-                resetActiveGestureState()
-                updateDebug("stroke \(stroke.direction.rawValue): \(result.resolverOutput.kind.rawValue)")
-            case .none:
-                updateDebug("stroke \(stroke.direction.rawValue): ignored")
-                break
-            }
+            handleStrokeEnded(stroke, sourceEvent: event)
 
         case .pinchEnded(let pinch):
-            timeoutGeneration += 1
-            idleDiscardGeneration += 1
-            if suppressActiveGestureUntilRelease {
-                suppressActiveGestureUntilRelease = false
-                updateDebug("pinch \(pinch.direction.rawValue): ignored after idle discard")
-                publishStatus()
-                return
-            }
-            pendingRestoreTap = nil
-            guard !cancelForTopologyChangeIfNeeded(at: pinch.timestampMilliseconds) else {
-                return
-            }
-            if !resolverSessionActive {
-                beginResolverSession(
-                    pointer: pinch.pointer,
-                    modifiers: pinch.modifiers,
-                    timestampMilliseconds: pinch.timestampMilliseconds,
-                    debugPrefix: "late pinch begin",
-                    fallingBackToFrontmost: pinch.direction == .outward
-                )
-            }
-            let result = route(.pinchEnded(GesturePinch(
-                direction: pinch.direction,
-                timestampMilliseconds: pinch.timestampMilliseconds,
-                eventID: pinch.eventID,
-                isCancelled: pinch.isCancelled,
-                modifiers: pinch.modifiers
-            )), actionID: pinch.eventID)
-            if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
-                onPreviewEnded()
-                resetActiveGestureState()
-            }
-            updateDebug("pinch \(pinch.direction.rawValue): \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")")
+            handlePinchEnded(pinch, sourceEvent: event)
 
         case .tapEnded(let tap):
             idleDiscardGeneration += 1
             if suppressActiveGestureUntilRelease {
                 suppressActiveGestureUntilRelease = false
                 updateDebug("tap ignored after idle discard")
+                captureOwnership.releaseOwner(for: event)
                 publishStatus()
                 return
             }
             handleRestoreTap(tap)
+            captureOwnership.releaseOwner(for: event)
 
         case .ended(let timestampMilliseconds):
-            idleDiscardGeneration += 1
-            if suppressActiveGestureUntilRelease {
-                suppressActiveGestureUntilRelease = false
-                updateDebug("ended ignored after idle discard")
-                publishStatus()
-                return
-            }
-            guard !cancelForTopologyChangeIfNeeded(at: timestampMilliseconds) else {
-                return
-            }
-            let result = route(.release(timestampMilliseconds: timestampMilliseconds), actionID: "release-\(timestampMilliseconds)")
-            if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
-                onPreviewEnded()
-                resetActiveGestureState()
-            }
-            updateDebug("release: \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")")
+            handleEnded(at: timestampMilliseconds, sourceEvent: event)
+
+        case .deviceEnded(let end):
+            handleEnded(at: end.timestampMilliseconds, sourceEvent: event)
 
         case .cancelled(let reason, let timestampMilliseconds):
-            timeoutGeneration += 1
-            idleDiscardGeneration += 1
-            resetActiveGestureState()
-            onPreviewEnded()
-            _ = coordinator.cancel(reason, at: timestampMilliseconds)
-            updateDebug("cancelled: \(reason.rawValue)")
+            handleCancelled(reason, at: timestampMilliseconds, sourceEvent: event)
+
+        case .deviceCancelled(let cancellation):
+            handleCancelled(cancellation.reason, at: cancellation.timestampMilliseconds, sourceEvent: event)
         }
 
         publishStatus()
+    }
+
+    private func handleMovement(at timestampMilliseconds: Int) {
+        guard !suppressActiveGestureUntilRelease else {
+            return
+        }
+        guard !cancelForTopologyChangeIfNeeded(at: timestampMilliseconds) else {
+            return
+        }
+        scheduleIdleDiscard(at: timestampMilliseconds)
+    }
+
+    private func handleStrokeEnded(_ stroke: CapturedGestureStroke, sourceEvent event: CapturedGestureEvent) {
+        guard !suppressActiveGestureUntilRelease else {
+            suppressActiveGestureUntilRelease = false
+            updateDebug("stroke \(stroke.direction.rawValue): ignored after idle discard")
+            captureOwnership.releaseOwner(for: event)
+            publishStatus()
+            return
+        }
+        pendingRestoreTap = nil
+        guard !cancelForTopologyChangeIfNeeded(at: stroke.timestampMilliseconds) else {
+            return
+        }
+        if !resolverSessionActive {
+            beginResolverSession(
+                pointer: stroke.pointer,
+                modifiers: stroke.modifiers,
+                timestampMilliseconds: stroke.timestampMilliseconds,
+                debugPrefix: "late stroke begin"
+            )
+        }
+        let result = route(.strokeEnded(GestureStroke(
+            direction: stroke.direction,
+            timestampMilliseconds: stroke.timestampMilliseconds,
+            eventID: stroke.eventID,
+            modifiers: stroke.modifiers
+        )), actionID: stroke.eventID)
+        switch result.resolverOutput.kind {
+        case .preview:
+            resolverSessionActive = true
+            stagedStrokeDirections.append(stroke.direction)
+            lastPresentedPreviewLabel = nil
+            updateDebug("stroke \(stroke.direction.rawValue): preview \(result.resolverOutput.intent?.command.displayName ?? "unknown")")
+        case .commit, .cancel, .passThrough:
+            onPreviewEnded()
+            captureOwnership.releaseOwner(for: event)
+            resetActiveGestureState()
+            updateDebug("stroke \(stroke.direction.rawValue): \(result.resolverOutput.kind.rawValue)")
+        case .none:
+            updateDebug("stroke \(stroke.direction.rawValue): ignored")
+            break
+        }
+    }
+
+    private func handlePinchEnded(_ pinch: CapturedGesturePinch, sourceEvent event: CapturedGestureEvent) {
+        timeoutGeneration += 1
+        idleDiscardGeneration += 1
+        if suppressActiveGestureUntilRelease {
+            suppressActiveGestureUntilRelease = false
+            updateDebug("pinch \(pinch.direction.rawValue): ignored after idle discard")
+            captureOwnership.releaseOwner(for: event)
+            publishStatus()
+            return
+        }
+        pendingRestoreTap = nil
+        guard !cancelForTopologyChangeIfNeeded(at: pinch.timestampMilliseconds) else {
+            return
+        }
+        if !resolverSessionActive {
+            beginResolverSession(
+                pointer: pinch.pointer,
+                modifiers: pinch.modifiers,
+                timestampMilliseconds: pinch.timestampMilliseconds,
+                debugPrefix: "late pinch begin",
+                fallingBackToFrontmost: pinch.direction == .outward
+            )
+        }
+        let result = route(.pinchEnded(GesturePinch(
+            direction: pinch.direction,
+            timestampMilliseconds: pinch.timestampMilliseconds,
+            eventID: pinch.eventID,
+            isCancelled: pinch.isCancelled,
+            modifiers: pinch.modifiers
+        )), actionID: pinch.eventID)
+        captureOwnership.releaseOwner(for: event)
+        if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
+            onPreviewEnded()
+            resetActiveGestureState()
+        }
+        updateDebug("pinch \(pinch.direction.rawValue): \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")")
+    }
+
+    private func handleEnded(at timestampMilliseconds: Int, sourceEvent event: CapturedGestureEvent) {
+        idleDiscardGeneration += 1
+        if suppressActiveGestureUntilRelease {
+            suppressActiveGestureUntilRelease = false
+            updateDebug("ended ignored after idle discard")
+            captureOwnership.releaseOwner(for: event)
+            publishStatus()
+            return
+        }
+        guard !cancelForTopologyChangeIfNeeded(at: timestampMilliseconds) else {
+            return
+        }
+        let result = route(.release(timestampMilliseconds: timestampMilliseconds), actionID: "release-\(timestampMilliseconds)")
+        captureOwnership.releaseOwner(for: event)
+        if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
+            onPreviewEnded()
+            resetActiveGestureState()
+        }
+        updateDebug("release: \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")")
+    }
+
+    private func handleCancelled(_ reason: GestureCancelReason, at timestampMilliseconds: Int, sourceEvent event: CapturedGestureEvent) {
+        timeoutGeneration += 1
+        idleDiscardGeneration += 1
+        captureOwnership.releaseOwner(for: event)
+        resetActiveGestureState()
+        onPreviewEnded()
+        _ = coordinator.cancel(reason, at: timestampMilliseconds)
+        updateDebug("cancelled: \(reason.rawValue)")
     }
 
     private func beginResolverSession(
@@ -810,6 +1085,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         }
 
         onPreviewEnded()
+        captureOwnership.releaseOwner()
         resetActiveGestureState()
         updateDebug("topology changed: cancelled preview")
         publishStatus()
@@ -833,10 +1109,12 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
 
         guard let previous = pendingRestoreTap,
               previous.target == target,
+              previous.source == tap.source,
               previous.modifiers == tap.modifiers,
               tap.timestampMilliseconds - previous.timestampMilliseconds <= restoreDoubleTapWindowMilliseconds
         else {
             pendingRestoreTap = RestoreTapCandidate(
+                source: tap.source,
                 target: target,
                 modifiers: tap.modifiers,
                 timestampMilliseconds: tap.timestampMilliseconds
@@ -922,6 +1200,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             }
             let result = self.route(.timeout(timestampMilliseconds: timeoutTimestamp), actionID: "timeout-\(stroke.eventID)")
             if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
+                self.captureOwnership.releaseOwner()
                 self.resetActiveGestureState()
             }
             self.updateDebug("timeout: \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")")
@@ -986,6 +1265,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
 }
 
 private struct RestoreTapCandidate {
+    var source: CapturedGestureSource
     var target: WindowTargetIdentity
     var modifiers: Set<ModifierRole>
     var timestampMilliseconds: Int
