@@ -952,6 +952,9 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
                 debugPrefix: "late stroke begin"
             )
         }
+        if activeGestureModifierMode != .unmodified {
+            onPreviewEnded()
+        }
         let result = route(.strokeEnded(GestureStroke(
             direction: stroke.direction,
             timestampMilliseconds: stroke.timestampMilliseconds,
@@ -962,7 +965,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         case .preview:
             resolverSessionActive = true
             stagedStrokeDirections.append(stroke.direction)
-            lastPresentedPreviewLabel = nil
+            presentResolvedPreview(from: result.resolverOutput, pointer: stroke.pointer, recognizedAt: stroke.timestampMilliseconds)
             updateDebug("stroke \(stroke.direction.rawValue): preview \(result.resolverOutput.intent?.command.displayName ?? "unknown")")
         case .commit, .cancel, .passThrough:
             onPreviewEnded()
@@ -998,6 +1001,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
                 fallingBackToFrontmost: pinch.direction == .outward
             )
         }
+        onPreviewEnded()
         let result = route(.pinchEnded(GesturePinch(
             direction: pinch.direction,
             timestampMilliseconds: pinch.timestampMilliseconds,
@@ -1025,10 +1029,10 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         guard !cancelForTopologyChangeIfNeeded(at: timestampMilliseconds) else {
             return
         }
+        onPreviewEnded()
         let result = route(.release(timestampMilliseconds: timestampMilliseconds), actionID: "release-\(timestampMilliseconds)")
         captureOwnership.releaseOwner(for: event)
         if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
-            onPreviewEnded()
             resetActiveGestureState()
         }
         updateDebug("release: \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")\(result.commandResult.debugSuffix)")
@@ -1138,8 +1142,8 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
 
         pendingRestoreTap = nil
         let command = settings.centerBehavior.keyboardCommand
-        let result = coordinator.dispatch(command, to: target, actionID: tap.eventID)
         onPreviewEnded()
+        let result = coordinator.dispatch(command, to: target, actionID: tap.eventID)
         if let commandResult = result.commandResult {
             commandCommitCount += 1
             onCommandResult(commandResult)
@@ -1200,6 +1204,12 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         case .stroke(let direction):
             switch activeGestureModifierMode {
             case .unmodified:
+                if stagedStrokeDirections.isEmpty,
+                   direction.isHorizontal,
+                   !hasReachedDesktopSpaceHoldThreshold(at: progress.timestampMilliseconds) {
+                    return nil
+                }
+
                 return GestureSequenceResolver.command(
                     for: stagedStrokeDirections + [direction],
                     modifierMode: activeGestureModifierMode,
@@ -1234,6 +1244,31 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         }
     }
 
+    private func hasReachedDesktopSpaceHoldThreshold(at timestampMilliseconds: Int) -> Bool {
+        guard let activeGestureStartedAt else {
+            return false
+        }
+
+        return timestampMilliseconds - activeGestureStartedAt >= GestureResolverConfiguration(settings: settings).desktopSpaceMovementHoldMilliseconds
+    }
+
+    private func presentResolvedPreview(
+        from output: GestureResolverOutput,
+        pointer: ScreenPoint,
+        recognizedAt timestampMilliseconds: Int
+    ) {
+        guard settings.previewsEnabled,
+              settings.overlayPreviewSize != .off,
+              let command = output.intent?.command
+        else {
+            return
+        }
+
+        lastPresentedPreviewLabel = command.displayName
+        onPreviewChanged(command, fullscreenState(for: command), displayMovementPreview(for: command), pointer)
+        recordPreviewLatency(recognizedAt: timestampMilliseconds)
+    }
+
     private func scheduleTimeout(after stroke: CapturedGestureStroke) {
         timeoutGeneration += 1
         let generation = timeoutGeneration
@@ -1246,6 +1281,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             guard !self.cancelForTopologyChangeIfNeeded(at: timeoutTimestamp) else {
                 return
             }
+            self.onPreviewEnded()
             let result = self.route(.timeout(timestampMilliseconds: timeoutTimestamp), actionID: "timeout-\(stroke.eventID)")
             if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
                 self.captureOwnership.releaseOwner()
@@ -1330,6 +1366,12 @@ private extension CenterBehavior {
         case .unsnap:
             .unsnap
         }
+    }
+}
+
+private extension GestureDirection {
+    var isHorizontal: Bool {
+        self == .left || self == .right
     }
 }
 
@@ -1536,10 +1578,10 @@ final class GesturePreviewOverlayController {
         )
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.ignoresMouseEvents = true
         panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
         panel.contentView = previewView
     }
 
@@ -1566,7 +1608,7 @@ final class GesturePreviewOverlayController {
         panel.orderFrontRegardless()
 
         let workItem = DispatchWorkItem { [weak self] in
-            self?.panel.orderOut(nil)
+            self?.hide()
         }
         hideWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2), execute: workItem)
@@ -1575,6 +1617,7 @@ final class GesturePreviewOverlayController {
     func hide() {
         hideWorkItem?.cancel()
         hideWorkItem = nil
+        panel.alphaValue = 0
         previewView.displayMovementPreview = nil
         panel.orderOut(nil)
     }
