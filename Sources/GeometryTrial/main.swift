@@ -106,28 +106,38 @@ func runTrial(for app: TrialApp, displays: [DisplayGeometry]) {
     }
 
     guard let originalAccessibilityFrame = readFrame(trialWindow.window),
-          let display = nearestDisplay(forAccessibilityFrame: originalAccessibilityFrame, displays: displays)
+          let desktopTopY = desktopTopY(displays: displays)
     else {
         logger.write([
             "kind": "app-result",
             "app": app.name,
             "status": "unavailable",
-            "reason": "Could not read original frame or resolve display."
+            "reason": "Could not read original frame or resolve display topology."
         ])
         return
     }
 
-    let originalFrame = converter.accessibilityToAppKit(originalAccessibilityFrame, on: display.frame)
+    let originalFrame = converter.accessibilityToAppKit(originalAccessibilityFrame, desktopTopY: desktopTopY)
+    guard let display = nearestDisplay(forAppKitFrame: originalFrame, displays: displays) else {
+        logger.write([
+            "kind": "app-result",
+            "app": app.name,
+            "status": "unavailable",
+            "reason": "Could not resolve display for original frame."
+        ])
+        return
+    }
+
     let destinations: [SnapDestination] = [.leftHalf, .topRight, .bottomRight]
     var results: [[String: Any]] = []
 
     for destination in destinations {
         let requested = engine.frame(for: destination, on: display, gridSpacing: 0)
-        let requestedAX = converter.appKitToAccessibility(requested, on: display.frame)
+        let requestedAX = converter.appKitToAccessibility(requested, desktopTopY: desktopTopY)
         let setSucceeded = setFrame(requestedAX, for: trialWindow.window)
         Thread.sleep(forTimeInterval: 0.25)
         let appliedAX = readFrame(trialWindow.window)
-        let applied = appliedAX.map { converter.accessibilityToAppKit($0, on: display.frame) }
+        let applied = appliedAX.map { converter.accessibilityToAppKit($0, desktopTopY: desktopTopY) }
         let result = engine.evaluateAppliedFrame(requested: requested, applied: applied)
 
         results.append([
@@ -140,11 +150,11 @@ func runTrial(for app: TrialApp, displays: [DisplayGeometry]) {
         ])
     }
 
-    let restoreAX = converter.appKitToAccessibility(originalFrame, on: display.frame)
+    let restoreAX = converter.appKitToAccessibility(originalFrame, desktopTopY: desktopTopY)
     let restoreSetSucceeded = setFrame(restoreAX, for: trialWindow.window)
     Thread.sleep(forTimeInterval: 0.25)
     let restoredAX = readFrame(trialWindow.window)
-    let restored = restoredAX.map { converter.accessibilityToAppKit($0, on: display.frame) }
+    let restored = restoredAX.map { converter.accessibilityToAppKit($0, desktopTopY: desktopTopY) }
     let restoreResult = engine.evaluateAppliedFrame(requested: originalFrame, applied: restored)
 
     logger.write([
@@ -228,10 +238,14 @@ func setFrame(_ frame: GeometryRect, for window: AXUIElement) -> Bool {
     return positionResult == .success && sizeResult == .success
 }
 
-func nearestDisplay(forAccessibilityFrame frame: GeometryRect, displays: [DisplayGeometry]) -> DisplayGeometry? {
+func nearestDisplay(forAppKitFrame frame: GeometryRect, displays: [DisplayGeometry]) -> DisplayGeometry? {
     displays.min { lhs, rhs in
         distance(from: frame, to: lhs.frame) < distance(from: frame, to: rhs.frame)
     }
+}
+
+func desktopTopY(displays: [DisplayGeometry]) -> Double? {
+    displays.map(\.frame.maxY).max()
 }
 
 func distance(from rect: GeometryRect, to displayFrame: GeometryRect) -> Double {

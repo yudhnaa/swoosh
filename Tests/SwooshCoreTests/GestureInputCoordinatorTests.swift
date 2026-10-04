@@ -17,7 +17,7 @@ struct GestureInputCoordinatorTests {
     }
 
     @Test
-    func eligibleUnmodifiedSwipeDispatchesLatchedTargetOnceAfterTimeout() {
+    func eligibleQuickUnmodifiedSwipeDispatchesSnapOnceAfterTimeout() {
         let dispatcher = MockGestureDispatcher()
         let coordinator = coordinator(dispatcher: dispatcher)
         coordinator.start(permissionReady: true, captureReady: true)
@@ -31,6 +31,24 @@ struct GestureInputCoordinatorTests {
         #expect(committed.resolverOutput.intent?.command == .snapLeft)
         #expect(committed.commandResult?.status == .performed)
         #expect(dispatcher.commands == [.snapLeft])
+        #expect(dispatcher.targets == [target])
+    }
+
+    @Test
+    func eligibleHeldUnmodifiedSwipeDispatchesDesktopSpaceMoveOnceAfterTimeout() {
+        let dispatcher = MockGestureDispatcher()
+        let coordinator = coordinator(dispatcher: dispatcher)
+        coordinator.start(permissionReady: true, captureReady: true)
+
+        #expect(coordinator.handle(.begin(start())).resolverOutput == .none)
+        #expect(coordinator.handle(.strokeEnded(stroke(.left, at: 550))).resolverOutput.kind == .preview)
+
+        let committed = coordinator.handle(.timeout(timestampMilliseconds: 1_350), actionID: "left-1")
+
+        #expect(committed.resolverOutput.kind == .commit)
+        #expect(committed.resolverOutput.intent?.command == .moveSpaceLeft)
+        #expect(committed.commandResult?.status == .performed)
+        #expect(dispatcher.commands == [.moveSpaceLeft])
         #expect(dispatcher.targets == [target])
     }
 
@@ -82,6 +100,50 @@ struct GestureInputCoordinatorTests {
         #expect(duplicate.resolverOutput == .none)
         #expect(dispatcher.commands == [.centerAndUnsnap])
         #expect(dispatcher.targets == [target])
+    }
+
+    @Test
+    func exposesFullscreenStateWhenDispatcherProvidesIt() {
+        let dispatcher = MockGestureDispatcher()
+        dispatcher.fullscreenStates[target] = true
+        let coordinator = coordinator(dispatcher: dispatcher)
+
+        #expect(coordinator.isFullscreen(target) == true)
+        #expect(coordinator.isFullscreen(WindowTargetIdentity(processIdentifier: 43, elementIdentifier: "other")) == nil)
+    }
+
+    @Test
+    func fullscreenStateIsUnknownWhenDispatcherDoesNotProvideIt() {
+        let dispatcher = MinimalGestureDispatcher()
+        let coordinator = GestureInputCoordinator(dispatcher: dispatcher)
+
+        #expect(coordinator.isFullscreen(target) == nil)
+    }
+
+    @Test
+    func exposesDisplayMovementPreviewWhenDispatcherProvidesIt() {
+        let dispatcher = MockGestureDispatcher()
+        let context = DisplayMovementPreviewContext(
+            displays: [
+                DisplayGeometry(
+                    id: "main",
+                    frame: GeometryRect(x: 0, y: 0, width: 100, height: 80),
+                    usableFrame: GeometryRect(x: 0, y: 0, width: 100, height: 80)
+                ),
+                DisplayGeometry(
+                    id: "right",
+                    frame: GeometryRect(x: 100, y: 0, width: 100, height: 80),
+                    usableFrame: GeometryRect(x: 100, y: 0, width: 100, height: 80)
+                )
+            ],
+            currentDisplayID: "main",
+            highlightedDisplayID: "right"
+        )
+        dispatcher.displayMovementPreviews[.moveDisplayRight] = context
+        let coordinator = coordinator(dispatcher: dispatcher)
+
+        #expect(coordinator.displayMovementPreview(for: .moveDisplayRight, target: target) == context)
+        #expect(coordinator.displayMovementPreview(for: .snapRight, target: target) == nil)
     }
 
     @Test
@@ -239,13 +301,29 @@ struct GestureInputCoordinatorTests {
     }
 }
 
-private final class MockGestureDispatcher: WindowCommandDispatching {
+private final class MockGestureDispatcher: WindowCommandDispatching, WindowFullscreenStateProviding, WindowDisplayMovementPreviewProviding {
     private(set) var commands: [KeyboardCommand] = []
     private(set) var targets: [WindowTargetIdentity] = []
+    var fullscreenStates: [WindowTargetIdentity: Bool] = [:]
+    var displayMovementPreviews: [KeyboardCommand: DisplayMovementPreviewContext] = [:]
 
     func dispatch(_ command: KeyboardCommand, to target: WindowTargetIdentity) -> WindowCommandResult {
         commands.append(command)
         targets.append(target)
         return WindowCommandResult(command: command, status: .performed, target: target)
+    }
+
+    func isFullscreen(_ target: WindowTargetIdentity) -> Bool? {
+        fullscreenStates[target]
+    }
+
+    func displayMovementPreview(for command: KeyboardCommand, target: WindowTargetIdentity) -> DisplayMovementPreviewContext? {
+        displayMovementPreviews[command]
+    }
+}
+
+private final class MinimalGestureDispatcher: WindowCommandDispatching {
+    func dispatch(_ command: KeyboardCommand, to target: WindowTargetIdentity) -> WindowCommandResult {
+        WindowCommandResult(command: command, status: .performed, target: target)
     }
 }

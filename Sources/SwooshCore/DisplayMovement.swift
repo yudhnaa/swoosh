@@ -162,7 +162,8 @@ public struct DisplayMovementPlanner {
                 return DisplayCandidate(
                     display: candidate,
                     directionalDistance: directionalDistance,
-                    perpendicularDistance: perpendicularDistance(from: source.frame, to: candidate.frame, direction: direction)
+                    perpendicularDistance: perpendicularDistance(from: source.frame, to: candidate.frame, direction: direction),
+                    perpendicularCenterDistance: perpendicularCenterDistance(from: source.frame, to: candidate.frame, direction: direction)
                 )
             }
             .sorted()
@@ -234,6 +235,15 @@ public struct DisplayMovementPlanner {
         }
     }
 
+    private func perpendicularCenterDistance(from source: GeometryRect, to candidate: GeometryRect, direction: DisplayMoveDirection) -> Double {
+        switch direction {
+        case .left, .right:
+            return abs(source.center.y - candidate.center.y)
+        case .up, .down:
+            return abs(source.center.x - candidate.center.x)
+        }
+    }
+
     private func axisGap(sourceMin: Double, sourceMax: Double, candidateMin: Double, candidateMax: Double) -> Double {
         if candidateMax < sourceMin {
             return sourceMin - candidateMax
@@ -251,6 +261,7 @@ private struct DisplayCandidate: Comparable {
     var display: DisplayGeometry
     var directionalDistance: Double
     var perpendicularDistance: Double
+    var perpendicularCenterDistance: Double
 
     static func < (lhs: DisplayCandidate, rhs: DisplayCandidate) -> Bool {
         if lhs.directionalDistance != rhs.directionalDistance {
@@ -259,6 +270,10 @@ private struct DisplayCandidate: Comparable {
 
         if lhs.perpendicularDistance != rhs.perpendicularDistance {
             return lhs.perpendicularDistance < rhs.perpendicularDistance
+        }
+
+        if lhs.perpendicularCenterDistance != rhs.perpendicularCenterDistance {
+            return lhs.perpendicularCenterDistance < rhs.perpendicularCenterDistance
         }
 
         return lhs.display.id < rhs.display.id

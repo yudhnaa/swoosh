@@ -290,17 +290,31 @@ public final class WindowFrameHistory {
         currentFrame: GeometryRect,
         reachableDisplay: DisplayGeometry
     ) -> WindowFrameHistoryOutcome {
+        plan(action, target: target, currentFrame: currentFrame, displays: [reachableDisplay])
+    }
+
+    public func plan(
+        _ action: CenterRestoreAction,
+        target: WindowTargetIdentity,
+        currentFrame: GeometryRect,
+        displays: [DisplayGeometry]
+    ) -> WindowFrameHistoryOutcome {
+        guard !displays.isEmpty else {
+            return .noOp
+        }
+
         let baseFrame = currentFrameAdjustedForManualChange(target: target, currentFrame: currentFrame)
         switch action {
         case .center:
-            return .planned(currentFrame.centered(in: reachableDisplay.usableFrame))
+            return .planned(currentFrame.centered(in: display(containing: currentFrame, in: displays).usableFrame))
         case .unsnap:
             guard let originalFrame = baseFrame else {
                 return .noOp
             }
-            return .planned(originalFrame.clamped(to: reachableDisplay.usableFrame))
+            return .planned(originalFrame.clamped(to: display(containing: originalFrame, in: displays).usableFrame))
         case .centerAndUnsnap:
-            return (baseFrame ?? currentFrame).centered(in: reachableDisplay.usableFrame).planned
+            let frame = baseFrame ?? currentFrame
+            return frame.centered(in: display(containing: frame, in: displays).usableFrame).planned
         }
     }
 
@@ -317,6 +331,10 @@ public final class WindowFrameHistory {
 
         return originalFrames[target]
     }
+
+    private func display(containing frame: GeometryRect, in displays: [DisplayGeometry]) -> DisplayGeometry {
+        DisplayMovementPlanner().display(containing: frame, in: displays)!
+    }
 }
 
 private extension GeometryRect {
@@ -329,21 +347,37 @@ public struct CoordinateConverter {
     public init() {}
 
     public func appKitToAccessibility(_ rect: GeometryRect, on displayFrame: GeometryRect) -> GeometryRect {
+        appKitToAccessibility(rect, desktopTopY: displayFrame.maxY)
+    }
+
+    public func accessibilityToAppKit(_ rect: GeometryRect, on displayFrame: GeometryRect) -> GeometryRect {
+        accessibilityToAppKit(rect, desktopTopY: displayFrame.maxY)
+    }
+
+    public func appKitToAccessibility(_ rect: GeometryRect, desktopTopY: Double) -> GeometryRect {
         GeometryRect(
             x: rect.x,
-            y: displayFrame.maxY - rect.maxY,
+            y: desktopTopY - rect.maxY,
             width: rect.width,
             height: rect.height
         )
     }
 
-    public func accessibilityToAppKit(_ rect: GeometryRect, on displayFrame: GeometryRect) -> GeometryRect {
+    public func accessibilityToAppKit(_ rect: GeometryRect, desktopTopY: Double) -> GeometryRect {
         GeometryRect(
             x: rect.x,
-            y: displayFrame.maxY - rect.y - rect.height,
+            y: desktopTopY - rect.y - rect.height,
             width: rect.width,
             height: rect.height
         )
+    }
+
+    public func accessibilityToAppKit(_ point: GeometryPoint, desktopTopY: Double) -> GeometryPoint {
+        GeometryPoint(x: point.x, y: desktopTopY - point.y)
+    }
+
+    public func appKitToAccessibility(_ point: GeometryPoint, desktopTopY: Double) -> GeometryPoint {
+        GeometryPoint(x: point.x, y: desktopTopY - point.y)
     }
 }
 
@@ -368,6 +402,28 @@ public struct SystemDisplayProvider {
             DisplayGeometry(screen: screen, index: index)
         }
     }
+
+    public var topologyToken: String {
+        let snapshot = displays()
+            .sorted { $0.id < $1.id }
+            .map { display in
+                [
+                    display.id,
+                    "\(display.frame.x)",
+                    "\(display.frame.y)",
+                    "\(display.frame.width)",
+                    "\(display.frame.height)",
+                    "\(display.usableFrame.x)",
+                    "\(display.usableFrame.y)",
+                    "\(display.usableFrame.width)",
+                    "\(display.usableFrame.height)",
+                    "\(display.scaleFactor)"
+                ].joined(separator: ":")
+            }
+            .joined(separator: "|")
+
+        return snapshot.isEmpty ? "none" : snapshot
+    }
 }
 
 public final class SystemWindowFrameController: WindowFrameControlling {
@@ -382,22 +438,22 @@ public final class SystemWindowFrameController: WindowFrameControlling {
     public func frame(for target: WindowTargetIdentity) -> GeometryRect? {
         guard let window = windowElement(for: target),
               let accessibilityFrame = accessibilityFrame(for: window),
-              let display = nearestDisplay(for: accessibilityFrame)
+              let desktopTopY = desktopTopY()
         else {
             return nil
         }
 
-        return converter.accessibilityToAppKit(accessibilityFrame, on: display.frame)
+        return converter.accessibilityToAppKit(accessibilityFrame, desktopTopY: desktopTopY)
     }
 
     public func setFrame(_ frame: GeometryRect, for target: WindowTargetIdentity) -> Bool {
         guard let window = windowElement(for: target),
-              let display = nearestDisplay(for: frame)
+              let desktopTopY = desktopTopY()
         else {
             return false
         }
 
-        let accessibilityFrame = converter.appKitToAccessibility(frame, on: display.frame)
+        let accessibilityFrame = converter.appKitToAccessibility(frame, desktopTopY: desktopTopY)
         return setAccessibilityFrame(accessibilityFrame, for: window)
     }
 
@@ -484,6 +540,10 @@ public final class SystemWindowFrameController: WindowFrameControlling {
         displayProvider.displays().min { lhs, rhs in
             distance(from: frame, to: lhs.frame) < distance(from: frame, to: rhs.frame)
         }
+    }
+
+    private func desktopTopY() -> Double? {
+        displayProvider.displays().map(\.frame.maxY).max()
     }
 
     private func distance(from rect: GeometryRect, to displayFrame: GeometryRect) -> Double {

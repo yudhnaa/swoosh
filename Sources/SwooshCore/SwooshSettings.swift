@@ -41,6 +41,10 @@ public enum KeyboardCommand: String, Codable, CaseIterable, Hashable, Sendable {
     case moveDisplayRight
     case moveDisplayUp
     case moveDisplayDown
+    case moveSpaceLeft
+    case moveSpaceRight
+    case moveSpaceUp
+    case moveSpaceDown
 }
 
 public struct SwooshSettings: Codable, Equatable, Sendable {

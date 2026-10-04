@@ -91,6 +91,39 @@ struct WindowGeometryTests {
     }
 
     @Test
+    func desktopCoordinateConversionUsesSharedTopAcrossOffsetDisplays() {
+        let converter = CoordinateConverter()
+        let primary = GeometryRect(x: 0, y: 0, width: 1512, height: 982)
+        let rightLower = GeometryRect(x: 1512, y: -220, width: 1728, height: 972)
+        let lower = GeometryRect(x: 0, y: -1_080, width: 1512, height: 1_080)
+        let desktopTopY = [primary, rightLower, lower].map(\.maxY).max()!
+        let appKitFrame = GeometryRect(x: 1_700, y: -120, width: 700, height: 500)
+
+        let accessibilityFrame = converter.appKitToAccessibility(appKitFrame, desktopTopY: desktopTopY)
+        let roundTripped = converter.accessibilityToAppKit(accessibilityFrame, desktopTopY: desktopTopY)
+
+        #expect(accessibilityFrame == GeometryRect(x: 1_700, y: 602, width: 700, height: 500))
+        #expect(roundTripped == appKitFrame)
+        #expect(accessibilityFrame != converter.appKitToAccessibility(appKitFrame, on: rightLower))
+    }
+
+    @Test
+    func pointerCoordinateConversionUsesSharedTopAcrossOffsetDisplays() {
+        let converter = CoordinateConverter()
+        let primary = GeometryRect(x: 0, y: 0, width: 1512, height: 982)
+        let sameHeightNeighbor = GeometryRect(x: 1512, y: 0, width: 1512, height: 982)
+        let lowerDifferentResolution = GeometryRect(x: 1512, y: -1_080, width: 1_920, height: 1_080)
+        let desktopTopY = [primary, sameHeightNeighbor, lowerDifferentResolution].map(\.maxY).max()!
+
+        let appKitPoint = GeometryPoint(x: 2_200, y: -520)
+        let accessibilityPoint = converter.appKitToAccessibility(appKitPoint, desktopTopY: desktopTopY)
+        let roundTripped = converter.accessibilityToAppKit(accessibilityPoint, desktopTopY: desktopTopY)
+
+        #expect(accessibilityPoint == GeometryPoint(x: 2_200, y: 1_502))
+        #expect(roundTripped == appKitPoint)
+    }
+
+    @Test
     func successfulSnapsPreserveFirstOriginalFrameAcrossThreeSnaps() throws {
         let history = WindowFrameHistory()
         let target = targetIdentity()

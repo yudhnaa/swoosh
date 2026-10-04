@@ -202,6 +202,137 @@ struct PrivateMultitouchCaptureTests {
         #expect(beganAgain.first?.isBegin == true)
     }
 
+    @Test
+    func routerKeepsBuiltInAndExternalRecognizersIndependent() {
+        let router = MultitouchCaptureEventRouter()
+        let builtIn = CapturedGestureSource(deviceID: "multitouch-1", generation: 3)
+        let external = CapturedGestureSource(deviceID: "multitouch-2", generation: 3)
+        router.register(key: "built-in", source: builtIn)
+        router.register(key: "external", source: external)
+
+        _ = router.process(
+            key: "built-in",
+            touches: twoTouches(centerX: 0.20, spread: 0.10),
+            context: context(frame: 1, timestamp: 1_000)
+        )
+        _ = router.process(
+            key: "external",
+            touches: twoTouches(centerX: 0.70, spread: 0.10),
+            context: context(frame: 1, timestamp: 1_010)
+        )
+
+        let builtInEnd = router.process(
+            key: "built-in",
+            touches: twoTouches(centerX: 0.44, spread: 0.10),
+            context: context(frame: 2, timestamp: 1_020)
+        ) + router.process(
+            key: "built-in",
+            touches: [],
+            context: context(frame: 3, timestamp: 1_030)
+        )
+        let externalEnd = router.process(
+            key: "external",
+            touches: twoTouches(centerX: 0.42, spread: 0.10),
+            context: context(frame: 2, timestamp: 1_040)
+        ) + router.process(
+            key: "external",
+            touches: [],
+            context: context(frame: 3, timestamp: 1_050)
+        )
+
+        #expect(builtInEnd.contains { $0.progressKind == .stroke(.right) })
+        #expect(builtInEnd.contains { $0.strokeDirection == .right })
+        #expect(builtInEnd.compactMap(\.eventID).allSatisfy { $0.hasPrefix("multitouch-1-g3-") })
+        #expect(externalEnd.contains { $0.progressKind == .stroke(.left) })
+        #expect(externalEnd.contains { $0.strokeDirection == .left })
+        #expect(externalEnd.compactMap(\.eventID).allSatisfy { $0.hasPrefix("multitouch-2-g3-") })
+    }
+
+    @Test
+    func routerDoesNotCombineContactsAcrossDevices() {
+        let router = MultitouchCaptureEventRouter()
+        router.register(key: "built-in", source: CapturedGestureSource(deviceID: "multitouch-1", generation: 4))
+        router.register(key: "external", source: CapturedGestureSource(deviceID: "multitouch-2", generation: 4))
+
+        let builtIn = router.process(
+            key: "built-in",
+            touches: [PrivateTouchSample(id: 1, state: 2, x: 0.20, y: 0.50)],
+            context: context(frame: 1)
+        )
+        let external = router.process(
+            key: "external",
+            touches: [PrivateTouchSample(id: 1, state: 2, x: 0.80, y: 0.50)],
+            context: context(frame: 1)
+        )
+
+        #expect(builtIn.isEmpty)
+        #expect(external.isEmpty)
+    }
+
+    @Test
+    func routerIgnoresUnknownDevicesAndHandlesZeroContactRelease() {
+        let router = MultitouchCaptureEventRouter()
+        let source = CapturedGestureSource(deviceID: "multitouch-1", generation: 5)
+        router.register(key: "known", source: source)
+
+        let unknown = router.process(
+            key: "unknown",
+            touches: twoTouches(centerX: 0.20, spread: 0.10),
+            context: context(frame: 1)
+        )
+        let began = router.process(
+            key: "known",
+            touches: twoTouches(centerX: 0.20, spread: 0.10),
+            context: context(frame: 1)
+        )
+        let ended = router.process(
+            key: "known",
+            touches: [],
+            context: context(frame: 2)
+        )
+
+        #expect(unknown.isEmpty)
+        #expect(began.first?.source == source)
+        #expect(ended.count == 1)
+        #expect(ended.first?.isTap == true)
+        #expect(ended.first?.source == source)
+    }
+
+    @Test
+    func ownershipGateIgnoresCompetingDeviceThroughRelease() {
+        let gate = CaptureEventOwnershipGate()
+        let first = CapturedGestureSource(deviceID: "multitouch-1", generation: 6)
+        let second = CapturedGestureSource(deviceID: "multitouch-2", generation: 6)
+
+        #expect(gate.shouldAccept(.began(CapturedGestureStart(source: first, pointer: pointer, modifiers: [], timestampMilliseconds: 1_000))))
+        #expect(!gate.shouldAccept(.began(CapturedGestureStart(source: second, pointer: pointer, modifiers: [], timestampMilliseconds: 1_010))))
+        #expect(!gate.shouldAccept(.strokeEnded(CapturedGestureStroke(source: second, direction: .left, pointer: pointer, modifiers: [], timestampMilliseconds: 1_020, eventID: "second"))))
+        #expect(gate.shouldAccept(.strokeEnded(CapturedGestureStroke(source: first, direction: .right, pointer: pointer, modifiers: [], timestampMilliseconds: 1_030, eventID: "first"))))
+
+        gate.releaseOwner(for: .strokeEnded(CapturedGestureStroke(source: first, direction: .right, pointer: pointer, modifiers: [], timestampMilliseconds: 1_030, eventID: "first")))
+
+        #expect(gate.shouldAccept(.began(CapturedGestureStart(source: second, pointer: pointer, modifiers: [], timestampMilliseconds: 1_040))))
+    }
+
+    @Test
+    func ownershipGateReleasesOwnerForTerminalTap() {
+        let gate = CaptureEventOwnershipGate()
+        let first = CapturedGestureSource(deviceID: "multitouch-1", generation: 7)
+        let second = CapturedGestureSource(deviceID: "multitouch-2", generation: 7)
+
+        #expect(gate.shouldAccept(.began(CapturedGestureStart(source: first, pointer: pointer, modifiers: [], timestampMilliseconds: 1_000))))
+
+        gate.releaseOwner(for: .tapEnded(CapturedGestureTap(
+            source: first,
+            pointer: pointer,
+            modifiers: [],
+            timestampMilliseconds: 1_010,
+            eventID: "first-tap"
+        )))
+
+        #expect(gate.shouldAccept(.began(CapturedGestureStart(source: second, pointer: pointer, modifiers: [], timestampMilliseconds: 1_020))))
+    }
+
     private var pointer: ScreenPoint {
         ScreenPoint(x: 500, y: 300)
     }
@@ -269,7 +400,7 @@ private extension CapturedGestureEvent {
             pinch.eventID
         case .tapEnded(let tap):
             tap.eventID
-        case .began, .movement, .changed, .ended, .cancelled:
+        case .began, .movement, .deviceMovement, .changed, .ended, .deviceEnded, .cancelled, .deviceCancelled:
             nil
         }
     }
@@ -285,11 +416,17 @@ private extension CapturedGestureEvent {
         if case .movement = self {
             return true
         }
+        if case .deviceMovement = self {
+            return true
+        }
         return false
     }
 
     var isEnd: Bool {
         if case .ended = self {
+            return true
+        }
+        if case .deviceEnded = self {
             return true
         }
         return false
@@ -306,6 +443,10 @@ private extension CapturedGestureEvent {
         if case .cancelled(let reason, _) = self {
             return reason
         }
+        if case .deviceCancelled(let cancellation) = self {
+            return cancellation.reason
+        }
         return nil
     }
+
 }

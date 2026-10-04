@@ -36,7 +36,10 @@ struct SettingsStoreTests {
         settings.overlayPreviewSize = .small
         settings.gridSpacing = 100
         settings.sensitivity = -1
-        settings.keyboardBindings = [.snapLeft: " Command + Option + Left "]
+        settings.keyboardBindings = [
+            .snapLeft: " Command + Option + Left ",
+            .moveDisplayRight: " Control + Option + Right "
+        ]
 
         try store.save(settings)
         let loaded = store.load()
@@ -49,6 +52,7 @@ struct SettingsStoreTests {
         #expect(loaded.gridSpacing == 32)
         #expect(loaded.sensitivity == 1)
         #expect(loaded.keyboardBindings[.snapLeft] == "command+option+left")
+        #expect(loaded.keyboardBindings[.moveDisplayRight] == "option+control+right")
 
         settings.sensitivity = 99
         try store.save(settings)

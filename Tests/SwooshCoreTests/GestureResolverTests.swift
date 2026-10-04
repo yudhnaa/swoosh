@@ -4,7 +4,7 @@ import Testing
 @Suite
 struct GestureResolverTests {
     @Test
-    func unmodifiedSingleSwipeMappingsStageThenCommitOnRelease() {
+    func quickUnmodifiedSingleSwipeMappingsStageThenCommitOnRelease() {
         let cases: [(GestureDirection, KeyboardCommand)] = [
             (.left, .snapLeft),
             (.right, .snapRight),
@@ -25,6 +25,64 @@ struct GestureResolverTests {
             #expect(committed.kind == .commit)
             #expect(committed.intent?.command == command)
         }
+    }
+
+    @Test
+    func heldHorizontalUnmodifiedSingleSwipeMapsToDesktopSpaceMovement() {
+        let cases: [(GestureDirection, KeyboardCommand)] = [
+            (.left, .moveSpaceLeft),
+            (.right, .moveSpaceRight)
+        ]
+
+        for (direction, command) in cases {
+            let resolver = GestureSequenceResolver()
+            #expect(resolver.process(.begin(start())) == .none)
+
+            let preview = resolver.process(.strokeEnded(stroke(direction, at: 550)))
+            let committed = resolver.process(.release(timestampMilliseconds: 570))
+
+            #expect(preview.kind == .preview)
+            #expect(preview.intent?.command == command)
+            #expect(preview.intent?.target == target)
+            #expect(committed.kind == .commit)
+            #expect(committed.intent?.command == command)
+        }
+    }
+
+    @Test
+    func heldVerticalUnmodifiedSingleSwipeKeepsWindowCommands() {
+        let cases: [(GestureDirection, KeyboardCommand)] = [
+            (.up, .maximize),
+            (.down, .minimize)
+        ]
+
+        for (direction, command) in cases {
+            let resolver = GestureSequenceResolver()
+            #expect(resolver.process(.begin(start())) == .none)
+
+            let preview = resolver.process(.strokeEnded(stroke(direction, at: 550)))
+            let committed = resolver.process(.release(timestampMilliseconds: 570))
+
+            #expect(preview.kind == .preview)
+            #expect(preview.intent?.command == command)
+            #expect(preview.intent?.target == target)
+            #expect(committed.kind == .commit)
+            #expect(committed.intent?.command == command)
+        }
+    }
+
+    @Test
+    func unmodifiedSingleSwipeBeforeSpaceHoldStillSnaps() {
+        let resolver = GestureSequenceResolver()
+        #expect(resolver.process(.begin(start())) == .none)
+
+        let preview = resolver.process(.strokeEnded(stroke(.left, at: 450)))
+        let committed = resolver.process(.release(timestampMilliseconds: 470))
+
+        #expect(preview.kind == .preview)
+        #expect(preview.intent?.command == .snapLeft)
+        #expect(committed.kind == .commit)
+        #expect(committed.intent?.command == .snapLeft)
     }
 
     @Test
@@ -112,7 +170,7 @@ struct GestureResolverTests {
     }
 
     @Test
-    func screenModifierMapsDirectionalSwipesToDeferredDisplayMovementCommands() {
+    func screenModifierTwoFingerTouchDownSwipeMapsToDisplayMovementCommands() {
         let cases: [(GestureDirection, KeyboardCommand)] = [
             (.left, .moveDisplayLeft),
             (.right, .moveDisplayRight),
