@@ -106,6 +106,37 @@ struct DisplayMovementTests {
     }
 
     @Test
+    func offsetLShapedLayoutMovesOutOfMiddleDisplayInBothDirections() throws {
+        let display2 = display("2-middle", x: 0, y: 0, width: 1512, height: 982)
+        let display1 = display("1-right", x: 1512, y: -180, width: 1728, height: 972)
+        let display3 = display("3-lower", x: 0, y: -1_080, width: 1512, height: 1_080)
+        let displays = [display1, display2, display3]
+        let current = GeometryRect(x: 420, y: 260, width: 700, height: 520)
+
+        let right = planner.planMove(
+            frame: current,
+            placement: .unsnapped,
+            direction: .right,
+            displays: displays,
+            gridSpacing: 0
+        )
+        let down = planner.planMove(
+            frame: current,
+            placement: .unsnapped,
+            direction: .down,
+            displays: displays,
+            gridSpacing: 0
+        )
+
+        let rightFrame = try #require(right.frame)
+        let downFrame = try #require(down.frame)
+        #expect(right.destinationDisplay?.id == "1-right")
+        #expect(down.destinationDisplay?.id == "3-lower")
+        #expect(containsCenter(of: rightFrame, in: display1.frame))
+        #expect(containsCenter(of: downFrame, in: display3.frame))
+    }
+
+    @Test
     func topologySnapshotsInvalidateStagedOperationsOnFrameScaleOrCountChange() {
         let target = WindowTargetIdentity(processIdentifier: 42, elementIdentifier: "window")
         let main = display("main", x: 0, y: 0, width: 1000, height: 700)
@@ -171,5 +202,14 @@ struct DisplayMovementTests {
             usableFrame: GeometryRect(x: x, y: usableY ?? y, width: width, height: usableHeight ?? height),
             scaleFactor: scale
         )
+    }
+
+    private func containsCenter(of frame: GeometryRect, in displayFrame: GeometryRect) -> Bool {
+        let centerX = frame.x + frame.width / 2
+        let centerY = frame.y + frame.height / 2
+        return centerX >= displayFrame.x &&
+            centerX <= displayFrame.maxX &&
+            centerY >= displayFrame.y &&
+            centerY <= displayFrame.maxY
     }
 }

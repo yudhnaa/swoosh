@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lifecycleController: lifecycleController,
         history: frameHistory,
         displayProvider: { [displayProvider] in displayProvider.mainDisplay() },
+        displayListProvider: { [displayProvider] in displayProvider.displays() },
         gridSpacingProvider: { [runtimeSettings] in runtimeSettings.gridSpacing }
     )
     private lazy var shortcutRegistrar = SystemKeyboardShortcutRegistrar { [weak self] command in
@@ -48,7 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         capture: gestureCapture,
         targetResolver: targetResolver,
         coordinator: gestureInputCoordinator,
-        topologyTokenProvider: { [displayProvider] in displayProvider.mainDisplay()?.id ?? "none" },
+        topologyTokenProvider: { [displayProvider] in displayProvider.topologyToken },
         onCommandResult: { [modelBridge] result in
             modelBridge.recordGestureCommandResult(result)
         },
@@ -61,8 +62,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         onDebugChanged: { [modelBridge] summary in
             modelBridge.recordGestureDebugSummary(summary)
         },
-        onPreviewChanged: { [weak self, runtimeSettings] command, pointer in
-            self?.gesturePreviewOverlay.show(command, size: runtimeSettings.settings.overlayPreviewSize, near: pointer)
+        onPreviewChanged: { [weak self, runtimeSettings] command, fullscreenState, displayMovementPreview, pointer in
+            self?.gesturePreviewOverlay.show(
+                command,
+                fullscreenState: fullscreenState,
+                displayMovementPreview: displayMovementPreview,
+                size: runtimeSettings.settings.overlayPreviewSize,
+                near: pointer
+            )
         },
         onPreviewEnded: { [weak self] in
             self?.gesturePreviewOverlay.hide()
@@ -280,6 +287,7 @@ final class KeyboardRuntimeSettings {
 private struct SystemDiagnostics: Equatable {
     var operatingSystem: String
     var processorArchitecture: String
+    var displayCount: Int
     var displaySummary: String
 }
 
@@ -307,6 +315,7 @@ private struct SystemDiagnosticsProvider: SystemDiagnosticsProviding {
         return SystemDiagnostics(
             operatingSystem: os,
             processorArchitecture: architecture,
+            displayCount: NSScreen.screens.count,
             displaySummary: displays.isEmpty ? "No active displays" : displays
         )
     }
@@ -594,7 +603,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
     private let onCaptureDiagnostics: (PrivateCaptureDiagnostics) -> Void
     private let onStatusChanged: (GestureInputStatus, GestureInputFailureReason?) -> Void
     private let onDebugChanged: (String) -> Void
-    private let onPreviewChanged: (KeyboardCommand, ScreenPoint) -> Void
+    private let onPreviewChanged: (KeyboardCommand, Bool?, DisplayMovementPreviewContext?, ScreenPoint) -> Void
     private let onPreviewEnded: () -> Void
     private var settings = SwooshSettings.defaults
     private var timeoutGeneration = 0
@@ -606,6 +615,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
     private var pendingRestoreTap: RestoreTapCandidate?
     private var activeGestureTarget: WindowTargetIdentity?
     private var activeGestureModifierMode: GestureModifierMode = .unsupported
+    private var activeGestureStartedAt: Int?
     private var stagedStrokeDirections: [GestureDirection] = []
     private var lastPresentedPreviewLabel: String?
     private var idleDiscardGeneration = 0
@@ -632,7 +642,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         onCaptureDiagnostics: @escaping (PrivateCaptureDiagnostics) -> Void,
         onStatusChanged: @escaping (GestureInputStatus, GestureInputFailureReason?) -> Void,
         onDebugChanged: @escaping (String) -> Void,
-        onPreviewChanged: @escaping (KeyboardCommand, ScreenPoint) -> Void,
+        onPreviewChanged: @escaping (KeyboardCommand, Bool?, DisplayMovementPreviewContext?, ScreenPoint) -> Void,
         onPreviewEnded: @escaping () -> Void
     ) {
         self.capture = capture
@@ -857,6 +867,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             if resolverSessionActive {
                 activeGestureTarget = target
                 activeGestureModifierMode = modifierMode(for: start.modifiers, settings: settings)
+                activeGestureStartedAt = start.timestampMilliseconds
                 lastPresentedPreviewLabel = nil
                 scheduleIdleDiscard(at: start.timestampMilliseconds)
                 updateDebug("begin accepted: modifiers=\(start.modifiers.debugNames)")
@@ -957,7 +968,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             onPreviewEnded()
             captureOwnership.releaseOwner(for: event)
             resetActiveGestureState()
-            updateDebug("stroke \(stroke.direction.rawValue): \(result.resolverOutput.kind.rawValue)")
+            updateDebug("stroke \(stroke.direction.rawValue): \(result.resolverOutput.kind.rawValue)\(result.commandResult.debugSuffix)")
         case .none:
             updateDebug("stroke \(stroke.direction.rawValue): ignored")
             break
@@ -999,7 +1010,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             onPreviewEnded()
             resetActiveGestureState()
         }
-        updateDebug("pinch \(pinch.direction.rawValue): \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")")
+        updateDebug("pinch \(pinch.direction.rawValue): \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")\(result.commandResult.debugSuffix)")
     }
 
     private func handleEnded(at timestampMilliseconds: Int, sourceEvent event: CapturedGestureEvent) {
@@ -1020,7 +1031,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             onPreviewEnded()
             resetActiveGestureState()
         }
-        updateDebug("release: \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")")
+        updateDebug("release: \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")\(result.commandResult.debugSuffix)")
     }
 
     private func handleCancelled(_ reason: GestureCancelReason, at timestampMilliseconds: Int, sourceEvent event: CapturedGestureEvent) {
@@ -1059,6 +1070,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         if resolverSessionActive {
             activeGestureTarget = target
             activeGestureModifierMode = modifierMode(for: modifiers, settings: settings)
+            activeGestureStartedAt = timestampMilliseconds
             lastPresentedPreviewLabel = nil
             scheduleIdleDiscard(at: timestampMilliseconds)
             updateDebug("\(debugPrefix) accepted: modifiers=\(modifiers.debugNames)")
@@ -1071,6 +1083,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         if let commandResult = result.commandResult {
             commandCommitCount += 1
             onCommandResult(commandResult)
+            updateDebug(commandResult.debugSummary)
         }
         return result
     }
@@ -1130,6 +1143,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         if let commandResult = result.commandResult {
             commandCommitCount += 1
             onCommandResult(commandResult)
+            updateDebug(commandResult.debugSummary)
         }
         updateDebug("double tap restore: \(result.resolverOutput.kind.rawValue) \(command.displayName)")
     }
@@ -1146,16 +1160,32 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
 
         let label = command.displayName
         guard label != lastPresentedPreviewLabel else {
-            onPreviewChanged(command, progress.pointer)
+            onPreviewChanged(command, fullscreenState(for: command), displayMovementPreview(for: command), progress.pointer)
             recordPreviewLatency(recognizedAt: progress.timestampMilliseconds)
             updateDebug("live preview: \(label)")
             return
         }
 
         lastPresentedPreviewLabel = label
-        onPreviewChanged(command, progress.pointer)
+        onPreviewChanged(command, fullscreenState(for: command), displayMovementPreview(for: command), progress.pointer)
         recordPreviewLatency(recognizedAt: progress.timestampMilliseconds)
         updateDebug("live preview: \(label)")
+    }
+
+    private func fullscreenState(for command: KeyboardCommand) -> Bool? {
+        guard command == .toggleFullscreen, let activeGestureTarget else {
+            return nil
+        }
+
+        return coordinator.isFullscreen(activeGestureTarget)
+    }
+
+    private func displayMovementPreview(for command: KeyboardCommand) -> DisplayMovementPreviewContext? {
+        guard command.displayMoveDirection != nil, let activeGestureTarget else {
+            return nil
+        }
+
+        return coordinator.displayMovementPreview(for: command, target: activeGestureTarget)
     }
 
     private func recordPreviewLatency(recognizedAt timestamp: Int) {
@@ -1170,11 +1200,29 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         case .stroke(let direction):
             switch activeGestureModifierMode {
             case .unmodified:
-                return command(for: stagedStrokeDirections + [direction])
+                return GestureSequenceResolver.command(
+                    for: stagedStrokeDirections + [direction],
+                    modifierMode: activeGestureModifierMode,
+                    startedAt: activeGestureStartedAt,
+                    timestampMilliseconds: progress.timestampMilliseconds,
+                    configuration: GestureResolverConfiguration(settings: settings)
+                )
             case .general:
-                return direction == .down ? .close : nil
+                return GestureSequenceResolver.command(
+                    for: [direction],
+                    modifierMode: activeGestureModifierMode,
+                    startedAt: activeGestureStartedAt,
+                    timestampMilliseconds: progress.timestampMilliseconds,
+                    configuration: GestureResolverConfiguration(settings: settings)
+                )
             case .screen:
-                return screenCommand(for: direction)
+                return GestureSequenceResolver.command(
+                    for: [direction],
+                    modifierMode: activeGestureModifierMode,
+                    startedAt: activeGestureStartedAt,
+                    timestampMilliseconds: progress.timestampMilliseconds,
+                    configuration: GestureResolverConfiguration(settings: settings)
+                )
             case .unsupported:
                 return nil
             }
@@ -1259,6 +1307,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         }
         activeGestureTarget = nil
         activeGestureModifierMode = .unsupported
+        activeGestureStartedAt = nil
         stagedStrokeDirections = []
         lastPresentedPreviewLabel = nil
     }
@@ -1300,46 +1349,6 @@ private func modifierMode(for modifiers: Set<ModifierRole>, settings: SwooshSett
     return .unsupported
 }
 
-private func command(for strokes: [GestureDirection]) -> KeyboardCommand? {
-    switch strokes {
-    case [.left]:
-        .snapLeft
-    case [.right]:
-        .snapRight
-    case [.up]:
-        .maximize
-    case [.down]:
-        .minimize
-    case [.up, .up]:
-        .snapTop
-    case [.down, .down]:
-        .snapBottom
-    case [.left, .up], [.up, .left]:
-        .snapTopLeft
-    case [.right, .up], [.up, .right]:
-        .snapTopRight
-    case [.left, .down], [.down, .left]:
-        .snapBottomLeft
-    case [.right, .down], [.down, .right]:
-        .snapBottomRight
-    default:
-        nil
-    }
-}
-
-private func screenCommand(for direction: GestureDirection) -> KeyboardCommand {
-    switch direction {
-    case .left:
-        .moveDisplayLeft
-    case .right:
-        .moveDisplayRight
-    case .up:
-        .moveDisplayUp
-    case .down:
-        .moveDisplayDown
-    }
-}
-
 private extension OverlayPreviewSize {
     var panelSize: NSSize {
         switch self {
@@ -1352,6 +1361,11 @@ private extension OverlayPreviewSize {
         case .large:
             NSSize(width: 82, height: 58)
         }
+    }
+
+    var displayMovementPanelSize: NSSize {
+        let size = panelSize
+        return NSSize(width: size.width * 1.1, height: size.height * 1.1)
     }
 
     var cornerRadius: CGFloat {
@@ -1382,6 +1396,26 @@ private extension Result where Success == WindowTarget, Failure == WindowTargetF
 private extension Set where Element == ModifierRole {
     var debugNames: String {
         isEmpty ? "none" : map(\.rawValue).sorted().joined(separator: "+")
+    }
+}
+
+private extension WindowCommandResult {
+    var debugSummary: String {
+        if let reason, !reason.isEmpty {
+            return "command result: \(command.displayName) \(status.rawValue) - \(reason)"
+        }
+
+        return "command result: \(command.displayName) \(status.rawValue)"
+    }
+}
+
+private extension Optional where Wrapped == WindowCommandResult {
+    var debugSuffix: String {
+        guard let result = self else {
+            return ""
+        }
+
+        return "; \(result.debugSummary)"
     }
 }
 
@@ -1487,8 +1521,9 @@ private final class SettingsWindowController {
 final class GesturePreviewOverlayController {
     private let panel: NSPanel
     private let previewView: GesturePreviewOverlayView
+    private let coordinateConverter = CoordinateConverter()
     private var hideWorkItem: DispatchWorkItem?
-    private var currentSize = OverlayPreviewSize.large
+    private var currentPanelSize = OverlayPreviewSize.large.panelSize
 
     init() {
         previewView = GesturePreviewOverlayView(frame: NSRect(origin: .zero, size: OverlayPreviewSize.large.panelSize))
@@ -1508,15 +1543,23 @@ final class GesturePreviewOverlayController {
         panel.contentView = previewView
     }
 
-    func show(_ command: KeyboardCommand, size: OverlayPreviewSize, near pointer: ScreenPoint) {
+    func show(
+        _ command: KeyboardCommand,
+        fullscreenState: Bool?,
+        displayMovementPreview: DisplayMovementPreviewContext?,
+        size: OverlayPreviewSize,
+        near pointer: ScreenPoint
+    ) {
         guard size != .off else {
             hide()
             return
         }
 
         hideWorkItem?.cancel()
-        currentSize = size
+        currentPanelSize = displayMovementPreview == nil ? size.panelSize : size.displayMovementPanelSize
         previewView.command = command
+        previewView.fullscreenState = fullscreenState
+        previewView.displayMovementPreview = displayMovementPreview
         previewView.previewSize = size
         positionPanel(near: pointer)
         panel.alphaValue = 1
@@ -1532,20 +1575,20 @@ final class GesturePreviewOverlayController {
     func hide() {
         hideWorkItem?.cancel()
         hideWorkItem = nil
+        previewView.displayMovementPreview = nil
         panel.orderOut(nil)
     }
 
     private func positionPanel(near pointer: ScreenPoint) {
-        let rawPoint = NSPoint(x: pointer.x, y: pointer.y)
-        guard let screen = screen(containingCapturedPointer: rawPoint) ?? NSScreen.main ?? NSScreen.screens.first else {
+        let point = appKitPoint(fromCapturedPointer: pointer)
+        guard let screen = screen(containingAppKitPoint: point) ?? NSScreen.main ?? NSScreen.screens.first else {
             return
         }
 
         let frame = screen.visibleFrame
-        let size = currentSize.panelSize
+        let size = currentPanelSize
         let margin: CGFloat = 8
         let gap: CGFloat = 4
-        let point = appKitPoint(fromCapturedPointer: rawPoint, in: screen)
         var origin = NSPoint(x: point.x - (size.width / 2), y: point.y + gap)
         if origin.y + size.height > frame.maxY - margin {
             origin.y = point.y - size.height - gap
@@ -1555,30 +1598,40 @@ final class GesturePreviewOverlayController {
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
     }
 
-    private func screen(containingCapturedPointer point: NSPoint) -> NSScreen? {
+    private func screen(containingAppKitPoint point: NSPoint) -> NSScreen? {
         NSScreen.screens.first { screen in
-            let frame = screen.frame
-            let capturedFrame = NSRect(
-                x: frame.minX,
-                y: frame.minY,
-                width: frame.width,
-                height: frame.height
-            )
-            return NSPointInRect(point, capturedFrame)
+            NSPointInRect(point, screen.frame)
         }
     }
 
-    private func appKitPoint(fromCapturedPointer point: NSPoint, in screen: NSScreen) -> NSPoint {
-        let frame = screen.frame
+    private func appKitPoint(fromCapturedPointer point: ScreenPoint) -> NSPoint {
+        guard let desktopTopY = NSScreen.screens.map(\.frame.maxY).max() else {
+            return NSPoint(x: point.x, y: point.y)
+        }
+
+        let converted = coordinateConverter.accessibilityToAppKit(
+            GeometryPoint(x: point.x, y: point.y),
+            desktopTopY: desktopTopY
+        )
         return NSPoint(
-            x: point.x,
-            y: frame.maxY - (point.y - frame.minY)
+            x: converted.x,
+            y: converted.y
         )
     }
 }
 
 private final class GesturePreviewOverlayView: NSView {
     var command: KeyboardCommand = .maximize {
+        didSet {
+            needsDisplay = true
+        }
+    }
+    var fullscreenState: Bool? {
+        didSet {
+            needsDisplay = true
+        }
+    }
+    var displayMovementPreview: DisplayMovementPreviewContext? {
         didSet {
             needsDisplay = true
         }
@@ -1610,6 +1663,16 @@ private final class GesturePreviewOverlayView: NSView {
         super.draw(dirtyRect)
 
         let capsule = bounds.insetBy(dx: 1, dy: 1)
+        if let displayMovementPreview, command.displayMoveDirection != nil {
+            drawDisplayMovementPreview(displayMovementPreview, in: capsule)
+            return
+        }
+
+        if let lifecycleButton = lifecycleButton(for: command, fullscreenState: fullscreenState) {
+            drawLifecycleButton(lifecycleButton, in: capsule)
+            return
+        }
+
         let radius = previewSize.cornerRadius
         let path = NSBezierPath(roundedRect: capsule, xRadius: radius, yRadius: radius)
         NSColor.white.withAlphaComponent(0.96).setFill()
@@ -1656,11 +1719,222 @@ private final class GesturePreviewOverlayView: NSView {
             rect = NSRect(x: capsule.midX - width / 2, y: capsule.midY - height / 2, width: width, height: height)
         case .close:
             rect = capsule.insetBy(dx: capsule.width * 0.18, dy: capsule.height * 0.18)
-        case .maximize, .toggleFullscreen, .moveDisplayLeft, .moveDisplayRight, .moveDisplayUp, .moveDisplayDown:
+        case .maximize,
+             .toggleFullscreen,
+             .moveDisplayLeft,
+             .moveDisplayRight,
+             .moveDisplayUp,
+             .moveDisplayDown,
+             .moveSpaceLeft,
+             .moveSpaceRight,
+             .moveSpaceUp,
+             .moveSpaceDown:
             rect = capsule
         }
 
         return NSBezierPath(rect: rect)
+    }
+
+    private func drawDisplayMovementPreview(_ preview: DisplayMovementPreviewContext, in bounds: NSRect) {
+        guard !preview.displays.isEmpty else {
+            return
+        }
+
+        let displayBounds = unionFrame(for: preview.displays)
+        guard displayBounds.width > 0, displayBounds.height > 0 else {
+            return
+        }
+
+        let padding = max(5, min(bounds.width, bounds.height) * 0.12)
+        let layoutArea = bounds.insetBy(dx: padding, dy: padding)
+        let scale = min(layoutArea.width / displayBounds.width, layoutArea.height / displayBounds.height)
+        let scaledWidth = displayBounds.width * scale
+        let scaledHeight = displayBounds.height * scale
+        let origin = NSPoint(
+            x: layoutArea.midX - scaledWidth / 2,
+            y: layoutArea.midY - scaledHeight / 2
+        )
+
+        for display in preview.displays {
+            let rect = previewRect(
+                for: display.frame,
+                displayBounds: displayBounds,
+                origin: origin,
+                scale: scale
+            )
+            let isCurrent = display.id == preview.currentDisplayID
+            let isHighlighted = display.id == preview.highlightedDisplayID
+            drawDisplayTile(in: rect, isCurrent: isCurrent, isHighlighted: isHighlighted)
+        }
+    }
+
+    private func unionFrame(for displays: [DisplayGeometry]) -> GeometryRect {
+        let minX = displays.map(\.frame.x).min() ?? 0
+        let minY = displays.map(\.frame.y).min() ?? 0
+        let maxX = displays.map(\.frame.maxX).max() ?? minX
+        let maxY = displays.map(\.frame.maxY).max() ?? minY
+        return GeometryRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    private func previewRect(
+        for frame: GeometryRect,
+        displayBounds: GeometryRect,
+        origin: NSPoint,
+        scale: CGFloat
+    ) -> NSRect {
+        NSRect(
+            x: origin.x + CGFloat(frame.x - displayBounds.x) * scale,
+            y: origin.y + CGFloat(displayBounds.maxY - frame.maxY) * scale,
+            width: max(6, CGFloat(frame.width) * scale),
+            height: max(6, CGFloat(frame.height) * scale)
+        )
+    }
+
+    private func drawDisplayTile(in rect: NSRect, isCurrent: Bool, isHighlighted: Bool) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 2.5, yRadius: 2.5)
+        let fill = isHighlighted
+            ? NSColor.systemBlue.withAlphaComponent(0.92)
+            : NSColor.white.withAlphaComponent(isCurrent ? 0.78 : 0.52)
+        fill.setFill()
+        path.fill()
+
+        let strokeColor: NSColor
+        if isHighlighted {
+            strokeColor = .systemBlue
+        } else if isCurrent {
+            strokeColor = .systemBlue.withAlphaComponent(0.72)
+        } else {
+            strokeColor = .black.withAlphaComponent(0.18)
+        }
+        strokeColor.setStroke()
+        path.lineWidth = isCurrent || isHighlighted ? 1.8 : 1
+        path.stroke()
+
+        if isCurrent && !isHighlighted {
+            let inset = min(rect.width, rect.height) * 0.16
+            let dot = NSBezierPath(ovalIn: rect.insetBy(dx: inset, dy: inset))
+            NSColor.systemBlue.withAlphaComponent(0.34).setFill()
+            dot.fill()
+        }
+    }
+
+    private func lifecycleButton(for command: KeyboardCommand, fullscreenState: Bool?) -> LifecyclePreviewButton? {
+        switch command {
+        case .close:
+            return .close
+        case .minimize:
+            return .minimize
+        case .toggleFullscreen:
+            return fullscreenState == true ? .exitFullscreen : .enterFullscreen
+        default:
+            return nil
+        }
+    }
+
+    private func drawLifecycleButton(_ button: LifecyclePreviewButton, in capsule: NSRect) {
+        let diameter = min(capsule.width, capsule.height) * 0.52
+        let rect = NSRect(
+            x: capsule.midX - diameter / 2,
+            y: capsule.midY - diameter / 2,
+            width: diameter,
+            height: diameter
+        )
+        let buttonPath = NSBezierPath(ovalIn: rect)
+
+        button.fillColor.setFill()
+        buttonPath.fill()
+
+        NSColor.white.withAlphaComponent(0.98).setStroke()
+        NSColor.white.withAlphaComponent(0.98).setFill()
+        switch button {
+        case .close:
+            drawCloseGlyph(in: rect)
+        case .minimize:
+            drawMinimizeGlyph(in: rect)
+        case .enterFullscreen:
+            drawFullscreenGlyph(in: rect, pointsInward: false)
+        case .exitFullscreen:
+            drawFullscreenGlyph(in: rect, pointsInward: true)
+        }
+    }
+
+    private func drawCloseGlyph(in rect: NSRect) {
+        let inset = rect.width * 0.32
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: rect.minX + inset, y: rect.minY + inset))
+        path.line(to: NSPoint(x: rect.maxX - inset, y: rect.maxY - inset))
+        path.move(to: NSPoint(x: rect.maxX - inset, y: rect.minY + inset))
+        path.line(to: NSPoint(x: rect.minX + inset, y: rect.maxY - inset))
+        path.lineCapStyle = .round
+        path.lineWidth = max(1.8, rect.width * 0.11)
+        path.stroke()
+    }
+
+    private func drawMinimizeGlyph(in rect: NSRect) {
+        let width = rect.width * 0.42
+        let height = max(2.0, rect.height * 0.10)
+        let glyphRect = NSRect(
+            x: rect.midX - width / 2,
+            y: rect.midY - height / 2,
+            width: width,
+            height: height
+        )
+        let path = NSBezierPath(roundedRect: glyphRect, xRadius: height / 2, yRadius: height / 2)
+        path.fill()
+    }
+
+    private func drawFullscreenGlyph(in rect: NSRect, pointsInward: Bool) {
+        let pad = rect.width * 0.27
+        let gap = rect.width * 0.08
+        let triangleHeight = rect.height * 0.38
+        let leftEdge = rect.minX + pad
+        let rightEdge = rect.maxX - pad
+        let centerLeft = rect.midX - gap / 2
+        let centerRight = rect.midX + gap / 2
+        let top = rect.midY - triangleHeight / 2
+        let bottom = rect.midY + triangleHeight / 2
+
+        let left = NSBezierPath()
+        let right = NSBezierPath()
+
+        if pointsInward {
+            left.move(to: NSPoint(x: leftEdge, y: top))
+            left.line(to: NSPoint(x: centerLeft, y: rect.midY))
+            left.line(to: NSPoint(x: leftEdge, y: bottom))
+            right.move(to: NSPoint(x: rightEdge, y: top))
+            right.line(to: NSPoint(x: centerRight, y: rect.midY))
+            right.line(to: NSPoint(x: rightEdge, y: bottom))
+        } else {
+            left.move(to: NSPoint(x: centerLeft, y: top))
+            left.line(to: NSPoint(x: leftEdge, y: rect.midY))
+            left.line(to: NSPoint(x: centerLeft, y: bottom))
+            right.move(to: NSPoint(x: centerRight, y: top))
+            right.line(to: NSPoint(x: rightEdge, y: rect.midY))
+            right.line(to: NSPoint(x: centerRight, y: bottom))
+        }
+
+        left.close()
+        right.close()
+        left.fill()
+        right.fill()
+    }
+}
+
+private enum LifecyclePreviewButton {
+    case close
+    case minimize
+    case enterFullscreen
+    case exitFullscreen
+
+    var fillColor: NSColor {
+        switch self {
+        case .close:
+            return .systemRed
+        case .minimize:
+            return .systemBlue
+        case .enterFullscreen, .exitFullscreen:
+            return .systemGreen
+        }
     }
 }
 
@@ -2124,9 +2398,9 @@ private struct PermissionDiagnosticsView: View {
                 permissionBadge(model.permissionDiagnostics.inputMonitoringTrusted)
             }
             SettingsDivider()
-            ReadOnlySettingsRow(title: "Private Capture", detail: model.permissionDiagnostics.privateMultitouch.reason) {
+            ReadOnlySettingsRow(title: "Private Capture", detail: privateCaptureDetail) {
                 StatusBadge(
-                    title: model.permissionDiagnostics.privateMultitouch.isUsable ? "Available" : "Unavailable",
+                    title: model.permissionDiagnostics.privateMultitouch.isUsable ? "Available" : "Needs Setup",
                     systemImage: model.permissionDiagnostics.privateMultitouch.isUsable ? "checkmark.circle.fill" : "xmark.circle.fill",
                     color: model.permissionDiagnostics.privateMultitouch.isUsable ? SettingsPalette.ready : SettingsPalette.destructive
                 )
@@ -2138,9 +2412,15 @@ private struct PermissionDiagnosticsView: View {
                     .monospacedDigit()
             }
             SettingsDivider()
-            ReadOnlySettingsRow(title: "System", detail: "\(model.systemDiagnostics.operatingSystem) · \(model.systemDiagnostics.processorArchitecture)") {
+            ReadOnlySettingsRow(title: "Displays", detail: displayDiagnosticsDetail) {
                 Text(model.systemDiagnostics.displaySummary)
                     .foregroundStyle(SettingsPalette.secondaryText)
+            }
+            SettingsDivider()
+            ReadOnlySettingsRow(title: "System", detail: "\(model.systemDiagnostics.operatingSystem) · \(model.systemDiagnostics.processorArchitecture)") {
+                Text("Hardware support still requires the physical verification task before release claims.")
+                    .foregroundStyle(SettingsPalette.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             SettingsDivider()
@@ -2174,6 +2454,17 @@ private struct PermissionDiagnosticsView: View {
         case .blocked(let requirements):
             requirements
         }
+    }
+
+    private var privateCaptureDetail: String {
+        let diagnostics = model.permissionDiagnostics.privateMultitouch
+        let active = "\(diagnostics.startedDeviceCount)/\(max(diagnostics.deviceCount, diagnostics.startedDeviceCount)) active"
+        return "\(active) · \(diagnostics.reason)"
+    }
+
+    private var displayDiagnosticsDetail: String {
+        let count = model.systemDiagnostics.displayCount
+        return count == 1 ? "1 active display" : "\(count) active displays"
     }
 
     private func buttonTitle(for kind: PermissionKind) -> String {
@@ -2214,7 +2505,7 @@ private struct WindowsSettingsView: View {
                     .frame(width: 180)
                 }
                 SettingsDivider()
-                SettingsRow(title: "Screen Modifier", detail: "Reserved for screen-oriented gestures in the MVP gesture grammar.") {
+                SettingsRow(title: "Screen Modifier", detail: "Required for display movement gestures.") {
                     Picker("Screen Modifier", selection: modifierBinding(\.screenModifier)) {
                         ForEach(ModifierRole.allCases, id: \.self) { role in
                             Text(role.displayName).tag(role)
@@ -2382,7 +2673,7 @@ private struct ShortcutsSettingsView: View {
     var body: some View {
         PreferencesPage(
             title: "Shortcuts",
-            subtitle: "Assign optional global shortcuts for the MVP window commands.",
+            subtitle: "Assign optional global shortcuts for window and display commands.",
             status: keyboardStatusBadge
         ) {
             SettingsGroup(

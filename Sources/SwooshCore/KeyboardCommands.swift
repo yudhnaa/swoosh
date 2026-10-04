@@ -447,7 +447,7 @@ public final class SystemKeyboardShortcutRegistrar: KeyboardShortcutRegistering 
 public extension KeyboardCommand {
     var isMVPKeyboardCommand: Bool {
         switch self {
-        case .moveDisplayLeft, .moveDisplayRight, .moveDisplayUp, .moveDisplayDown:
+        case .moveSpaceUp, .moveSpaceDown:
             false
         default:
             true
@@ -494,6 +494,14 @@ public extension KeyboardCommand {
             "Move to Display Up"
         case .moveDisplayDown:
             "Move to Display Down"
+        case .moveSpaceLeft:
+            "Move to Space Left"
+        case .moveSpaceRight:
+            "Move to Space Right"
+        case .moveSpaceUp:
+            "Move to Space Up"
+        case .moveSpaceDown:
+            "Move to Space Down"
         }
     }
 }

@@ -1,3 +1,5 @@
+import Carbon.HIToolbox
+import CoreGraphics
 import Foundation
 import Testing
 @testable import SwooshCore
@@ -10,6 +12,12 @@ struct KeyboardCommandTests {
         usableFrame: GeometryRect(x: 0, y: 38, width: 1512, height: 944),
         scaleFactor: 2
     )
+    private let externalDisplay = DisplayGeometry(
+        id: "external",
+        frame: GeometryRect(x: 1512, y: -120, width: 1920, height: 1080),
+        usableFrame: GeometryRect(x: 1512, y: -80, width: 1920, height: 1040),
+        scaleFactor: 1
+    )
 
     @Test
     func defaultsLeaveShortcutsUnassigned() {
@@ -17,7 +25,7 @@ struct KeyboardCommandTests {
     }
 
     @Test
-    func bindingValidatorRejectsDuplicateReservedUnsupportedAndDeferredCommands() {
+    func bindingValidatorRejectsDuplicateReservedAndMalformedCommands() {
         var settings = SwooshSettings.defaults
         settings.keyboardBindings = [
             .snapLeft: "Option + Command + Left",
@@ -25,7 +33,8 @@ struct KeyboardCommandTests {
             .close: "Command + Q",
             .center: "F13",
             .unsnap: "A",
-            .moveDisplayLeft: "Control + Option + Left"
+            .moveDisplayLeft: "Control + Option + Left",
+            .moveSpaceDown: "Control + Option + Down"
         ]
 
         let issues = KeyboardBindingValidator().issues(for: settings)
@@ -34,7 +43,8 @@ struct KeyboardCommandTests {
         #expect(issues.contains { $0.command == .close && $0.reason == .reservedSystemShortcut })
         #expect(issues.contains { $0.command == .center && $0.reason == .unsupportedKey })
         #expect(issues.contains { $0.command == .unsnap && $0.reason == .missingModifier })
-        #expect(issues.contains { $0.command == .moveDisplayLeft && $0.reason == .unsupportedCommand })
+        #expect(issues.contains { $0.command == .moveSpaceDown && $0.reason == .unsupportedCommand })
+        #expect(!issues.contains { $0.command == .moveDisplayLeft })
     }
 
     @Test
@@ -92,6 +102,21 @@ struct KeyboardCommandTests {
     }
 
     @Test
+    func displayMovementShortcutRegistersThroughExistingCoordinator() {
+        let registrar = MockShortcutRegistrar()
+        let coordinator = KeyboardShortcutCoordinator(registrar: registrar)
+        var settings = SwooshSettings.defaults
+        settings.keyboardBindings = [.moveDisplayRight: "control+option+right"]
+
+        let records = coordinator.apply(settings)
+
+        #expect(records.count == 1)
+        #expect(records[0].command == .moveDisplayRight)
+        #expect(records[0].binding == "option+control+right")
+        #expect(records[0].status == .registered)
+    }
+
+    @Test
     func dispatcherRunsAllSnapAndCenterRestoreCommands() throws {
         let target = targetIdentity()
         let resolver = MockKeyboardTargetResolver(target: target)
@@ -102,6 +127,7 @@ struct KeyboardCommandTests {
             frameController: frames,
             lifecycleController: lifecycle,
             displayProvider: { display },
+            displayListProvider: { [display] },
             gridSpacingProvider: { 0 }
         )
 
@@ -139,6 +165,7 @@ struct KeyboardCommandTests {
             frameController: MockWindowFrameController(initialFrames: [target: GeometryRect(x: 40, y: 80, width: 900, height: 600)]),
             lifecycleController: WindowLifecycleController(client: lifecycleClient),
             displayProvider: { display },
+            displayListProvider: { [display] },
             gridSpacingProvider: { 0 }
         )
 
@@ -158,6 +185,7 @@ struct KeyboardCommandTests {
             frameController: MockWindowFrameController(initialFrames: [target: GeometryRect(x: 40, y: 80, width: 900, height: 600)]),
             lifecycleController: lifecycle,
             displayProvider: { display },
+            displayListProvider: { [display] },
             gridSpacingProvider: { 0 }
         )
 
@@ -175,11 +203,344 @@ struct KeyboardCommandTests {
             frameController: MockWindowFrameController(initialFrames: [:]),
             lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
             displayProvider: { display },
+            displayListProvider: { [display] },
             gridSpacingProvider: { 0 }
         )
 
         #expect(dispatcher.dispatch(.snapLeft).status == .targetFailure)
-        #expect(dispatcher.dispatch(.moveDisplayLeft).status == .unavailable)
+        #expect(dispatcher.dispatch(.moveDisplayLeft).status == .targetFailure)
+    }
+
+    @Test
+    func keyboardAndGestureDisplayCommandsShareDispatcherSemantics() {
+        let target = targetIdentity()
+        let frames = MockWindowFrameController(initialFrames: [target: GeometryRect(x: 120, y: 200, width: 640, height: 480)])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: { [display] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let keyboardResult = dispatcher.dispatch(.moveDisplayRight)
+        let gestureResult = dispatcher.dispatch(.moveDisplayRight, to: target)
+
+        #expect(keyboardResult.status == .unavailable)
+        #expect(gestureResult.status == .unavailable)
+        #expect(keyboardResult.reason == gestureResult.reason)
+    }
+
+    @Test
+    func dispatcherMovesSnappedWindowToAdjacentDisplayPreservingLayout() {
+        let target = targetIdentity()
+        let initialFrame = SnapGeometryEngine().frame(for: .leftHalf, on: display, gridSpacing: 0)
+        let frames = MockWindowFrameController(initialFrames: [target: initialFrame])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: { [display, externalDisplay] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let result = dispatcher.dispatch(.moveDisplayRight, to: target)
+        let expected = SnapGeometryEngine().frame(for: .leftHalf, on: externalDisplay, gridSpacing: 0)
+
+        #expect(result.status == .performed)
+        #expect(result.requestedFrame == expected)
+        #expect(frames.frames[target] == expected)
+    }
+
+    @Test
+    func dispatcherMovesUnsnappedWindowToAdjacentDisplayAndRetainsSizeWherePossible() {
+        let target = targetIdentity()
+        let initialFrame = GeometryRect(x: 120, y: 200, width: 640, height: 480)
+        let frames = MockWindowFrameController(initialFrames: [target: initialFrame])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: { [display, externalDisplay] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let result = dispatcher.dispatch(.moveDisplayRight, to: target)
+
+        #expect(result.status == .performed)
+        #expect(result.requestedFrame?.width == initialFrame.width)
+        #expect(result.requestedFrame?.height == initialFrame.height)
+        #expect(result.requestedFrame?.x ?? 0 >= externalDisplay.usableFrame.x)
+        #expect(result.requestedFrame?.maxX ?? 0 <= externalDisplay.usableFrame.maxX)
+    }
+
+    @Test
+    func displayMovementPreviewReportsCurrentAndDirectionalDestinationDisplays() throws {
+        let target = targetIdentity()
+        let frames = MockWindowFrameController(initialFrames: [target: GeometryRect(x: 120, y: 200, width: 640, height: 480)])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: { [display, externalDisplay] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let preview = try #require(dispatcher.displayMovementPreview(for: .moveDisplayRight, target: target))
+
+        #expect(preview.displays.map(\.id) == ["external", "main"])
+        #expect(preview.currentDisplayID == "main")
+        #expect(preview.highlightedDisplayID == "external")
+    }
+
+    @Test
+    func displayMovementPreviewFallsBackToCurrentDisplayWhenNoNeighborExists() throws {
+        let target = targetIdentity()
+        let frames = MockWindowFrameController(initialFrames: [target: GeometryRect(x: 120, y: 200, width: 640, height: 480)])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: { [display] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let preview = try #require(dispatcher.displayMovementPreview(for: .moveDisplayRight, target: target))
+
+        #expect(preview.displays.map(\.id) == ["main"])
+        #expect(preview.currentDisplayID == "main")
+        #expect(preview.highlightedDisplayID == "main")
+    }
+
+    @Test
+    func dispatcherReportsUnavailableWhenNoAdjacentDisplayExists() {
+        let target = targetIdentity()
+        let frames = MockWindowFrameController(initialFrames: [target: GeometryRect(x: 120, y: 200, width: 640, height: 480)])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: { [display] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let result = dispatcher.dispatch(.moveDisplayRight, to: target)
+
+        #expect(result.status == .unavailable)
+        #expect(result.reason == "No active display is available in the requested direction.")
+    }
+
+    @Test
+    func dispatcherReportsGeometryFailureWhenDisplayMoveWriteIsRejected() {
+        let target = targetIdentity()
+        let frames = MockWindowFrameController(
+            initialFrames: [target: GeometryRect(x: 120, y: 200, width: 640, height: 480)],
+            rejectedTargets: [target]
+        )
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: { [display, externalDisplay] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let result = dispatcher.dispatch(.moveDisplayRight, to: target)
+
+        #expect(result.status == .geometryFailed)
+        #expect(result.reason == "Target rejected the requested frame.")
+    }
+
+    @Test
+    func dispatcherMovesWindowBetweenDesktopSpacesThroughInjectedMover() {
+        let target = targetIdentity()
+        let frame = GeometryRect(x: 120, y: 200, width: 640, height: 480)
+        let frames = MockWindowFrameController(initialFrames: [target: frame])
+        let spaces = MockDesktopSpaceMover()
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            desktopSpaceMover: spaces,
+            displayProvider: { display },
+            displayListProvider: { [display, externalDisplay] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let result = dispatcher.dispatch(.moveSpaceLeft, to: target)
+
+        #expect(result.status == .performed)
+        #expect(spaces.requests == [
+            DesktopSpaceMoveRequest(
+                target: target,
+                frame: frame,
+                direction: .left,
+                desktopTopY: display.frame.maxY
+            )
+        ])
+    }
+
+    @Test
+    func dispatcherReportsUnavailableForUnsupportedDesktopSpaceDirection() {
+        let target = targetIdentity()
+        let frame = GeometryRect(x: 120, y: 200, width: 640, height: 480)
+        let frames = MockWindowFrameController(initialFrames: [target: frame])
+        let spaces = MockDesktopSpaceMover(results: [.down: DesktopSpaceMovementResult(
+            status: .unavailable,
+            reason: "Desktop Spaces movement supports left and right directions only."
+        )])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            desktopSpaceMover: spaces,
+            displayProvider: { display },
+            displayListProvider: { [display] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let result = dispatcher.dispatch(.moveSpaceDown, to: target)
+
+        #expect(result.status == .unavailable)
+        #expect(result.reason == "Desktop Spaces movement supports left and right directions only.")
+        #expect(spaces.requests.map(\.direction) == [.down])
+    }
+
+    @Test
+    func missionControlSpaceMoverPlansGestureTargetControlArrowSequence() {
+        let activator = MockDesktopSpaceTargetActivator()
+        let mover = MissionControlDesktopSpaceMover(targetActivator: activator)
+        let target = targetIdentity(id: "pointer-window")
+        let frame = GeometryRect(x: 120, y: 200, width: 640, height: 480)
+
+        let result = mover.moveWindow(
+            target: target,
+            frame: frame,
+            direction: .right,
+            desktopTopY: display.frame.maxY
+        )
+
+        #expect(result.status == .performed)
+        #expect(result.reason == nil)
+        #expect(activator.activatedTargets == [target])
+
+        let left = mover.eventPlan(forAppKitFrame: frame, desktopTopY: display.frame.maxY, direction: .left)
+        let right = mover.eventPlan(forAppKitFrame: frame, desktopTopY: display.frame.maxY, direction: .right)
+        #expect(left.mouseDownPoint == CGPoint(x: 440, y: 312))
+        #expect(right.mouseDownPoint == CGPoint(x: 440, y: 312))
+        #expect(left.dragPoint == left.mouseDownPoint)
+        #expect(right.dragPoint == right.mouseDownPoint)
+        #expect(left.keyCode == CGKeyCode(kVK_LeftArrow))
+        #expect(right.keyCode == CGKeyCode(kVK_RightArrow))
+        #expect(left.controlKeyCode == CGKeyCode(kVK_Control))
+        #expect(right.controlKeyCode == CGKeyCode(kVK_Control))
+        #expect(left.eventSourceStateID == .hidSystemState)
+        #expect(right.eventSourceStateID == .hidSystemState)
+        #expect(left.eventTap == .cghidEventTap)
+        #expect(right.eventTap == .cghidEventTap)
+        #expect(left.controlEventFlags == .maskControl)
+        #expect(right.controlEventFlags == .maskControl)
+        #expect(left.arrowEventFlags == [.maskControl, .maskSecondaryFn, .maskNumericPad])
+        #expect(right.arrowEventFlags == [.maskControl, .maskSecondaryFn, .maskNumericPad])
+        #expect(left.mouseDownToDragDelaySeconds > 0)
+        #expect(left.dragToKeyDelaySeconds > 0)
+        #expect(left.controlToArrowDelaySeconds > 0)
+        #expect(left.keyToMouseUpDelaySeconds >= 0.3)
+    }
+
+    @Test
+    func missionControlSpaceMoverReportsUnavailableWhenTargetCannotActivate() {
+        let activator = MockDesktopSpaceTargetActivator(result: .failed("mock activation failed"))
+        let mover = MissionControlDesktopSpaceMover(targetActivator: activator)
+        let target = targetIdentity(id: "pointer-window")
+
+        let result = mover.moveWindow(
+            target: target,
+            frame: GeometryRect(x: 120, y: 200, width: 640, height: 480),
+            direction: .right,
+            desktopTopY: display.frame.maxY
+        )
+
+        #expect(result.status == .unavailable)
+        #expect(result.reason == "mock activation failed")
+        #expect(activator.activatedTargets == [target])
+    }
+
+    @Test
+    func centerRestoreUsesCurrentWindowDisplayAfterManualCrossDisplayMove() {
+        let target = targetIdentity()
+        let originalOnExternal = GeometryRect(x: 1_800, y: 160, width: 640, height: 480)
+        let manualOnMain = GeometryRect(x: 120, y: 180, width: 640, height: 480)
+        let frames = MockWindowFrameController(initialFrames: [target: originalOnExternal])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { externalDisplay },
+            displayListProvider: { [display, externalDisplay] },
+            gridSpacingProvider: { 0 }
+        )
+
+        #expect(dispatcher.dispatch(.snapLeft, to: target).status == .performed)
+        frames.frames[target] = manualOnMain
+
+        let result = dispatcher.dispatch(.centerAndUnsnap, to: target)
+
+        #expect(result.status == .performed)
+        #expect(result.requestedFrame == manualOnMain.centered(in: display.usableFrame))
+        #expect(frames.frames[target] == manualOnMain.centered(in: display.usableFrame))
+    }
+
+    @Test
+    func dispatcherRejectsDisplayMoveWhenTopologyChangesBeforeCommit() {
+        let target = targetIdentity()
+        let frames = MockWindowFrameController(initialFrames: [target: GeometryRect(x: 120, y: 200, width: 640, height: 480)])
+        var calls = 0
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: {
+                calls += 1
+                return calls == 1 ? [display, externalDisplay] : [display]
+            },
+            gridSpacingProvider: { 0 }
+        )
+
+        let result = dispatcher.dispatch(.moveDisplayRight, to: target)
+
+        #expect(result.status == .unavailable)
+        #expect(result.reason == "Display topology changed before the move could be applied.")
+        #expect(frames.frames[target] == GeometryRect(x: 120, y: 200, width: 640, height: 480))
+    }
+
+    @Test
+    func displayMoveAfterSnapPreservesOriginalFrameForRestore() {
+        let target = targetIdentity()
+        let original = GeometryRect(x: 120, y: 200, width: 640, height: 480)
+        let frames = MockWindowFrameController(initialFrames: [target: original])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { display },
+            displayListProvider: { [display, externalDisplay] },
+            gridSpacingProvider: { 0 }
+        )
+
+        #expect(dispatcher.dispatch(.snapLeft, to: target).status == .performed)
+        #expect(dispatcher.dispatch(.moveDisplayRight, to: target).status == .performed)
+        #expect(dispatcher.dispatch(.unsnap, to: target).status == .performed)
+
+        #expect(frames.frames[target] == original)
     }
 
     private func targetIdentity(id: String = "window") -> WindowTargetIdentity {
@@ -249,9 +610,14 @@ private struct MockKeyboardTargetResolver: KeyboardTargetResolving {
 
 private final class MockWindowFrameController: WindowFrameControlling {
     var frames: [WindowTargetIdentity: GeometryRect]
+    var rejectedTargets: Set<WindowTargetIdentity>
 
-    init(initialFrames: [WindowTargetIdentity: GeometryRect]) {
+    init(
+        initialFrames: [WindowTargetIdentity: GeometryRect],
+        rejectedTargets: Set<WindowTargetIdentity> = []
+    ) {
         frames = initialFrames
+        self.rejectedTargets = rejectedTargets
     }
 
     func frame(for target: WindowTargetIdentity) -> GeometryRect? {
@@ -259,12 +625,57 @@ private final class MockWindowFrameController: WindowFrameControlling {
     }
 
     func setFrame(_ frame: GeometryRect, for target: WindowTargetIdentity) -> Bool {
-        guard frames[target] != nil else {
+        guard frames[target] != nil, !rejectedTargets.contains(target) else {
             return false
         }
 
         frames[target] = frame
         return true
+    }
+}
+
+private struct DesktopSpaceMoveRequest: Equatable {
+    var target: WindowTargetIdentity
+    var frame: GeometryRect
+    var direction: DesktopSpaceMoveDirection
+    var desktopTopY: Double
+}
+
+private final class MockDesktopSpaceMover: DesktopSpaceMoving {
+    var results: [DesktopSpaceMoveDirection: DesktopSpaceMovementResult]
+    private(set) var requests: [DesktopSpaceMoveRequest] = []
+
+    init(results: [DesktopSpaceMoveDirection: DesktopSpaceMovementResult] = [:]) {
+        self.results = results
+    }
+
+    func moveWindow(
+        target: WindowTargetIdentity,
+        frame: GeometryRect,
+        direction: DesktopSpaceMoveDirection,
+        desktopTopY: Double
+    ) -> DesktopSpaceMovementResult {
+        requests.append(DesktopSpaceMoveRequest(
+            target: target,
+            frame: frame,
+            direction: direction,
+            desktopTopY: desktopTopY
+        ))
+        return results[direction] ?? DesktopSpaceMovementResult(status: .performed)
+    }
+}
+
+private final class MockDesktopSpaceTargetActivator: DesktopSpaceTargetActivating {
+    var result: DesktopSpaceTargetActivationResult
+    private(set) var activatedTargets: [WindowTargetIdentity] = []
+
+    init(result: DesktopSpaceTargetActivationResult = .success) {
+        self.result = result
+    }
+
+    func activate(_ target: WindowTargetIdentity) -> DesktopSpaceTargetActivationResult {
+        activatedTargets.append(target)
+        return result
     }
 }
 

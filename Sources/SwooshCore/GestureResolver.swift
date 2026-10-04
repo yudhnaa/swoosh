@@ -77,15 +77,18 @@ public struct GestureResolverOutput: Equatable, Sendable {
 
 public struct GestureResolverConfiguration: Equatable, Sendable {
     public var chainTimeoutMilliseconds: Int
+    public var desktopSpaceMovementHoldMilliseconds: Int
     public var generalModifier: ModifierRole
     public var screenModifier: ModifierRole
 
     public init(
         chainTimeoutMilliseconds: Int = SwooshSettings.defaultChainTimeoutMilliseconds,
+        desktopSpaceMovementHoldMilliseconds: Int = 500,
         generalModifier: ModifierRole = .control,
         screenModifier: ModifierRole = .command
     ) {
         self.chainTimeoutMilliseconds = chainTimeoutMilliseconds.clamped(to: SwooshSettings.chainTimeoutRange)
+        self.desktopSpaceMovementHoldMilliseconds = max(0, desktopSpaceMovementHoldMilliseconds)
         self.generalModifier = generalModifier
         self.screenModifier = screenModifier
     }
@@ -184,6 +187,36 @@ public final class GestureSequenceResolver {
         self.init(configuration: GestureResolverConfiguration(settings: settings))
     }
 
+    public static func command(
+        for strokes: [GestureDirection],
+        modifierMode: GestureModifierMode,
+        startedAt: Int?,
+        timestampMilliseconds: Int,
+        configuration: GestureResolverConfiguration = GestureResolverConfiguration()
+    ) -> KeyboardCommand? {
+        switch modifierMode {
+        case .unmodified:
+            return unmodifiedCommand(
+                for: strokes,
+                startedAt: startedAt,
+                timestampMilliseconds: timestampMilliseconds,
+                configuration: configuration
+            )
+        case .general:
+            guard strokes.count == 1, let direction = strokes.first else {
+                return nil
+            }
+            return generalCommand(for: direction)
+        case .screen:
+            guard strokes.count == 1, let direction = strokes.first else {
+                return nil
+            }
+            return screenCommand(for: direction)
+        case .unsupported:
+            return nil
+        }
+    }
+
     public var activeTopologyToken: String? {
         session?.topologyToken
     }
@@ -231,12 +264,27 @@ public final class GestureSequenceResolver {
                 session = active
                 return previewOrCancel(for: active)
             case .general:
-                guard let command = generalCommand(for: stroke.direction) else {
+                guard let command = Self.command(
+                    for: [stroke.direction],
+                    modifierMode: active.modifierMode,
+                    startedAt: active.startedAt,
+                    timestampMilliseconds: stroke.timestampMilliseconds,
+                    configuration: configuration
+                ) else {
                     return finish(.passThrough)
                 }
                 return commit(command, target: active.target, modifierMode: active.modifierMode)
             case .screen:
-                return commit(screenCommand(for: stroke.direction), target: active.target, modifierMode: active.modifierMode)
+                guard let command = Self.command(
+                    for: [stroke.direction],
+                    modifierMode: active.modifierMode,
+                    startedAt: active.startedAt,
+                    timestampMilliseconds: stroke.timestampMilliseconds,
+                    configuration: configuration
+                ) else {
+                    return finish(.passThrough)
+                }
+                return commit(command, target: active.target, modifierMode: active.modifierMode)
             case .unsupported:
                 return finish(.passThrough)
             }
@@ -260,7 +308,7 @@ public final class GestureSequenceResolver {
         case .release:
             guard let active = session,
                   active.modifierMode == .unmodified,
-                  let command = command(for: active.strokes)
+                  let command = command(for: active)
             else {
                 return .none
             }
@@ -272,7 +320,7 @@ public final class GestureSequenceResolver {
                   active.modifierMode == .unmodified,
                   let lastEndedAt = active.lastEndedAt,
                   timestamp - lastEndedAt >= configuration.chainTimeoutMilliseconds,
-                  let command = command(for: active.strokes)
+                  let command = command(for: active)
             else {
                 return .none
             }
@@ -309,7 +357,7 @@ public final class GestureSequenceResolver {
             return cancel(.overlongChain)
         }
 
-        guard let command = command(for: session.strokes) else {
+        guard let command = command(for: session) else {
             return cancel(.invalidChain)
         }
 
@@ -323,16 +371,51 @@ public final class GestureSequenceResolver {
         )
     }
 
-    private func command(for strokes: [GestureDirection]) -> KeyboardCommand? {
+    private func command(for session: GestureSession) -> KeyboardCommand? {
+        Self.command(
+            for: session.strokes,
+            modifierMode: session.modifierMode,
+            startedAt: session.startedAt,
+            timestampMilliseconds: session.lastEndedAt ?? session.startedAt,
+            configuration: configuration
+        )
+    }
+
+    private static func unmodifiedCommand(
+        for strokes: [GestureDirection],
+        startedAt: Int?,
+        timestampMilliseconds: Int,
+        configuration: GestureResolverConfiguration
+    ) -> KeyboardCommand? {
         switch strokes {
         case [.left]:
-            .snapLeft
+            singleStrokeCommand(
+                for: .left,
+                startedAt: startedAt,
+                timestampMilliseconds: timestampMilliseconds,
+                configuration: configuration
+            )
         case [.right]:
-            .snapRight
+            singleStrokeCommand(
+                for: .right,
+                startedAt: startedAt,
+                timestampMilliseconds: timestampMilliseconds,
+                configuration: configuration
+            )
         case [.up]:
-            .maximize
+            singleStrokeCommand(
+                for: .up,
+                startedAt: startedAt,
+                timestampMilliseconds: timestampMilliseconds,
+                configuration: configuration
+            )
         case [.down]:
-            .minimize
+            singleStrokeCommand(
+                for: .down,
+                startedAt: startedAt,
+                timestampMilliseconds: timestampMilliseconds,
+                configuration: configuration
+            )
         case [.up, .up]:
             .snapTop
         case [.down, .down]:
@@ -350,11 +433,46 @@ public final class GestureSequenceResolver {
         }
     }
 
-    private func generalCommand(for direction: GestureDirection) -> KeyboardCommand? {
+    private static func singleStrokeCommand(
+        for direction: GestureDirection,
+        startedAt: Int?,
+        timestampMilliseconds: Int,
+        configuration: GestureResolverConfiguration
+    ) -> KeyboardCommand {
+        if let startedAt,
+           timestampMilliseconds - startedAt >= configuration.desktopSpaceMovementHoldMilliseconds,
+           let command = desktopSpaceCommand(for: direction) {
+            return command
+        }
+
+        switch direction {
+        case .left:
+            return .snapLeft
+        case .right:
+            return .snapRight
+        case .up:
+            return .maximize
+        case .down:
+            return .minimize
+        }
+    }
+
+    private static func desktopSpaceCommand(for direction: GestureDirection) -> KeyboardCommand? {
+        switch direction {
+        case .left:
+            .moveSpaceLeft
+        case .right:
+            .moveSpaceRight
+        case .up, .down:
+            nil
+        }
+    }
+
+    private static func generalCommand(for direction: GestureDirection) -> KeyboardCommand? {
         direction == .down ? .close : nil
     }
 
-    private func screenCommand(for direction: GestureDirection) -> KeyboardCommand {
+    private static func screenCommand(for direction: GestureDirection) -> KeyboardCommand {
         switch direction {
         case .left:
             .moveDisplayLeft

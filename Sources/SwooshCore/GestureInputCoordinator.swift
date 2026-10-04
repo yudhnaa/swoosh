@@ -107,6 +107,14 @@ public final class GestureInputCoordinator {
         ))
     }
 
+    public func isFullscreen(_ target: WindowTargetIdentity) -> Bool? {
+        (dispatcher as? WindowFullscreenStateProviding)?.isFullscreen(target)
+    }
+
+    public func displayMovementPreview(for command: KeyboardCommand, target: WindowTargetIdentity) -> DisplayMovementPreviewContext? {
+        (dispatcher as? WindowDisplayMovementPreviewProviding)?.displayMovementPreview(for: command, target: target)
+    }
+
     @discardableResult
     public func handle(_ event: GestureResolverEvent, actionID: String? = nil) -> GestureInputResult {
         guard status == .running, settings.gesturesEnabled else {
