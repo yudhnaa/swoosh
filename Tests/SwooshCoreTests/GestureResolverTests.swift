@@ -143,6 +143,10 @@ struct GestureResolverTests {
         #expect(pinchOut.process(.begin(start())) == .none)
         #expect(pinchOut.process(.pinchEnded(pinch(.outward, at: 100))).intent?.command == .toggleFullscreen)
 
+        let doublePinchIn = GestureSequenceResolver()
+        #expect(doublePinchIn.process(.begin(start())) == .none)
+        #expect(doublePinchIn.process(.pinchEnded(pinch(.inward, inwardSegmentCount: 2, at: 100))).intent?.command == .quit)
+
         let cancelled = GestureSequenceResolver()
         #expect(cancelled.process(.begin(start())) == .none)
         let output = cancelled.process(.pinchEnded(pinch(.inward, at: 100, isCancelled: true)))
@@ -320,6 +324,7 @@ struct GestureResolverTests {
 
     private func pinch(
         _ direction: GesturePinchDirection,
+        inwardSegmentCount: Int? = nil,
         at timestamp: Int,
         id: String? = nil,
         isCancelled: Bool = false,
@@ -327,6 +332,7 @@ struct GestureResolverTests {
     ) -> GesturePinch {
         GesturePinch(
             direction: direction,
+            inwardSegmentCount: inwardSegmentCount,
             timestampMilliseconds: timestamp,
             eventID: id,
             isCancelled: isCancelled,

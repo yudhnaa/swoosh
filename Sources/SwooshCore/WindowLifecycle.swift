@@ -5,6 +5,7 @@ import Foundation
 public enum WindowLifecycleAction: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
     case minimize
     case requestClose
+    case quit
     case toggleFullscreen
 }
 
@@ -30,6 +31,7 @@ public struct WindowLifecycleResult: Equatable, Sendable {
 
 public protocol WindowLifecycleControlling {
     func isAlive(_ target: WindowTargetIdentity) -> Bool
+    func isApplicationAlive(_ target: WindowTargetIdentity) -> Bool
     func supportedActions(for target: WindowTargetIdentity) -> Set<WindowLifecycleAction>
     func perform(_ action: WindowLifecycleAction, for target: WindowTargetIdentity) -> WindowLifecycleResult
     func isFullscreen(_ target: WindowTargetIdentity) -> Bool?
@@ -58,22 +60,33 @@ public final class WindowLifecycleController {
 
     public func supportedActions(for target: WindowTargetIdentity) -> Set<WindowLifecycleAction> {
         guard client.isAlive(target) else {
-            return []
+            guard client.isApplicationAlive(target),
+                  client.supportedActions(for: target).contains(.quit)
+            else {
+                return []
+            }
+            return [.quit]
         }
 
         return client.supportedActions(for: target)
     }
 
     public func perform(_ action: WindowLifecycleAction, for target: WindowTargetIdentity) -> WindowLifecycleResult {
-        guard client.isAlive(target) else {
+        let targetAvailable = action == .quit
+            ? client.isApplicationAlive(target)
+            : client.isAlive(target)
+        guard targetAvailable else {
+            let reason = action == .quit
+                ? "The target application is no longer available."
+                : "The target window is no longer available."
             return WindowLifecycleResult(
                 action: action,
                 status: .targetLost,
-                reason: "The target window is no longer available."
+                reason: reason
             )
         }
 
-        if isFullscreenTransitioning(target) {
+        if action != .quit, isFullscreenTransitioning(target) {
             return WindowLifecycleResult(
                 action: action,
                 status: .transitioning,
@@ -85,7 +98,7 @@ public final class WindowLifecycleController {
             return WindowLifecycleResult(
                 action: action,
                 status: .unsupported,
-                reason: "The target window does not expose a supported control for \(action.rawValue)."
+                reason: "The target does not expose a supported control for \(action.rawValue)."
             )
         }
 
@@ -159,12 +172,20 @@ public struct SystemAccessibilityLifecycleClient: WindowLifecycleControlling {
         windowElement(for: target) != nil
     }
 
+    public func isApplicationAlive(_ target: WindowTargetIdentity) -> Bool {
+        NSRunningApplication(processIdentifier: target.processIdentifier) != nil
+    }
+
     public func supportedActions(for target: WindowTargetIdentity) -> Set<WindowLifecycleAction> {
-        guard let window = windowElement(for: target) else {
+        guard isApplicationAlive(target) else {
             return []
         }
 
-        var actions: Set<WindowLifecycleAction> = []
+        var actions: Set<WindowLifecycleAction> = [.quit]
+        guard let window = windowElement(for: target) else {
+            return actions
+        }
+
         if isAttributeSettable(kAXMinimizedAttribute, on: window) {
             actions.insert(.minimize)
         }
@@ -179,6 +200,20 @@ public struct SystemAccessibilityLifecycleClient: WindowLifecycleControlling {
     }
 
     public func perform(_ action: WindowLifecycleAction, for target: WindowTargetIdentity) -> WindowLifecycleResult {
+        if action == .quit {
+            guard let app = NSRunningApplication(processIdentifier: target.processIdentifier) else {
+                return WindowLifecycleResult(
+                    action: action,
+                    status: .targetLost,
+                    reason: "The target application is no longer available."
+                )
+            }
+
+            return app.terminate()
+                ? WindowLifecycleResult(action: action, status: .performed)
+                : rejected(action, result: .failure, control: "NSRunningApplication.terminate")
+        }
+
         guard let window = windowElement(for: target) else {
             return WindowLifecycleResult(
                 action: action,
@@ -204,6 +239,9 @@ public struct SystemAccessibilityLifecycleClient: WindowLifecycleControlling {
             }
 
             return press(button, action: action, control: "AXCloseButton")
+
+        case .quit:
+            return unsupported(action, reason: "Quit is handled at the application level.")
 
         case .toggleFullscreen:
             if isAttributeSettable("AXFullScreen", on: window), let isFullscreen = boolAttribute("AXFullScreen", from: window) {

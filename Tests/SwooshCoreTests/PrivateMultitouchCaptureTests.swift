@@ -55,6 +55,68 @@ struct PrivateMultitouchCaptureTests {
     }
 
     @Test
+    func recognizerSegmentsContinuousInwardPinchesOnOutwardReset() {
+        let recognizer = BuiltInTrackpadGestureRecognizer()
+
+        _ = recognizer.process(touches: twoTouches(spread: 0.24), context: context(frame: 1, timestamp: 1_000))
+        _ = recognizer.process(touches: twoTouches(spread: 0.14), context: context(frame: 2, timestamp: 1_040))
+        let outwardReset = recognizer.process(touches: twoTouches(spread: 0.24), context: context(frame: 3, timestamp: 1_080))
+        let secondPinch = recognizer.process(touches: twoTouches(spread: 0.14), context: context(frame: 4, timestamp: 1_120))
+        let ended = recognizer.process(touches: [], context: context(frame: 5, timestamp: 1_160))
+
+        #expect(!outwardReset.contains { $0.pinchDirection == .inward })
+        #expect(secondPinch.last?.progressKind == .pinch(.inward))
+        #expect(secondPinch.last?.progressInwardSegmentCount == 2)
+        #expect(ended.count == 1)
+        #expect(ended[0].pinchDirection == .inward)
+        #expect(ended[0].inwardSegmentCount == 2)
+    }
+
+    @Test
+    func recognizerDoesNotEmitPinchActionDuringFingerDownPause() {
+        let recognizer = BuiltInTrackpadGestureRecognizer()
+
+        _ = recognizer.process(touches: twoTouches(spread: 0.24), context: context(frame: 1, timestamp: 1_000))
+        _ = recognizer.process(touches: twoTouches(spread: 0.14), context: context(frame: 2, timestamp: 1_040))
+        let paused = recognizer.process(touches: twoTouches(spread: 0.14), context: context(frame: 3, timestamp: 1_240))
+        let ended = recognizer.process(touches: [], context: context(frame: 4, timestamp: 1_280))
+
+        #expect(!paused.contains { $0.pinchDirection == .inward })
+        #expect(ended.count == 1)
+        #expect(ended[0].pinchDirection == .inward)
+    }
+
+    @Test
+    func recognizerCountsPauseSeparatedInwardPinchesWithoutFingerRelease() {
+        let recognizer = BuiltInTrackpadGestureRecognizer()
+
+        _ = recognizer.process(touches: twoTouches(spread: 0.24), context: context(frame: 1, timestamp: 1_000))
+        _ = recognizer.process(touches: twoTouches(spread: 0.14), context: context(frame: 2, timestamp: 1_040))
+        let paused = recognizer.process(touches: twoTouches(spread: 0.14), context: context(frame: 3, timestamp: 1_240))
+        let secondPinch = recognizer.process(touches: twoTouches(spread: 0.06), context: context(frame: 4, timestamp: 1_280))
+        let ended = recognizer.process(touches: [], context: context(frame: 5, timestamp: 1_320))
+
+        #expect(!paused.contains { $0.pinchDirection == .inward })
+        #expect(secondPinch.last?.progressKind == .pinch(.inward))
+        #expect(secondPinch.last?.progressInwardSegmentCount == 2)
+        #expect(ended.count == 1)
+        #expect(ended[0].pinchDirection == .inward)
+        #expect(ended[0].inwardSegmentCount == 2)
+    }
+
+    @Test
+    func recognizerDoesNotCommitSmallPinchBelowRaisedThreshold() {
+        let recognizer = BuiltInTrackpadGestureRecognizer()
+
+        _ = recognizer.process(touches: twoTouches(spread: 0.20), context: context(frame: 1))
+        _ = recognizer.process(touches: twoTouches(spread: 0.16), context: context(frame: 2))
+        let ended = recognizer.process(touches: [], context: context(frame: 3))
+
+        #expect(ended.count == 1)
+        #expect(ended[0].isTap == true)
+    }
+
+    @Test
     func recognizerSwitchesDirectionDuringContinuousReversal() {
         let recognizer = BuiltInTrackpadGestureRecognizer()
 
@@ -392,6 +454,13 @@ private extension CapturedGestureEvent {
         return nil
     }
 
+    var inwardSegmentCount: Int? {
+        if case .pinchEnded(let pinch) = self {
+            return pinch.inwardSegmentCount
+        }
+        return nil
+    }
+
     var eventID: String? {
         switch self {
         case .strokeEnded(let stroke):
@@ -435,6 +504,13 @@ private extension CapturedGestureEvent {
     var progressKind: CapturedGestureProgressKind? {
         if case .changed(let progress) = self {
             return progress.kind
+        }
+        return nil
+    }
+
+    var progressInwardSegmentCount: Int? {
+        if case .changed(let progress) = self {
+            return progress.inwardSegmentCount
         }
         return nil
     }

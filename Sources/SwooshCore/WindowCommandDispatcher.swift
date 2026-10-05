@@ -427,6 +427,8 @@ public extension KeyboardCommand {
             .minimize
         case .close:
             .requestClose
+        case .quit:
+            .quit
         case .toggleFullscreen:
             .toggleFullscreen
         default:

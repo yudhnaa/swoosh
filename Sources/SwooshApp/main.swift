@@ -607,6 +607,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
     private let onPreviewEnded: () -> Void
     private var settings = SwooshSettings.defaults
     private var timeoutGeneration = 0
+    private var pinchTimeoutGeneration = 0
     private var resolverSessionActive = false
     private var capturedEventCount = 0
     private var titlebarRejectCount = 0
@@ -616,6 +617,9 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
     private var activeGestureTarget: WindowTargetIdentity?
     private var activeGestureModifierMode: GestureModifierMode = .unsupported
     private var activeGestureStartedAt: Int?
+    private var continuousInwardPinchCount = 0
+    private var lastInwardPinchTarget: WindowTargetIdentity?
+    private var pendingPinchGesture: PendingPinchGesture?
     private var stagedStrokeDirections: [GestureDirection] = []
     private var lastPresentedPreviewLabel: String?
     private var idleDiscardGeneration = 0
@@ -847,6 +851,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             timeoutGeneration += 1
             idleDiscardGeneration += 1
             suppressActiveGestureUntilRelease = false
+            resetContinuousPinchState()
             guard !resolverSessionActive else {
                 updateDebug("begin ignored during active chain")
                 return
@@ -886,15 +891,27 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             guard !cancelForTopologyChangeIfNeeded(at: progress.timestampMilliseconds) else {
                 return
             }
+            if case .pinch = progress.kind, !resolverSessionActive {
+                beginResolverSession(
+                    pointer: progress.pointer,
+                    modifiers: progress.modifiers,
+                    timestampMilliseconds: progress.timestampMilliseconds,
+                    debugPrefix: "late pinch progress begin",
+                    fallingBackToFrontmost: false
+                )
+            }
+            updatePendingPinch(from: progress)
             presentLivePreview(for: progress)
 
         case .strokeEnded(let stroke):
+            resetContinuousPinchState()
             handleStrokeEnded(stroke, sourceEvent: event)
 
         case .pinchEnded(let pinch):
             handlePinchEnded(pinch, sourceEvent: event)
 
         case .tapEnded(let tap):
+            resetContinuousPinchState()
             idleDiscardGeneration += 1
             if suppressActiveGestureUntilRelease {
                 suppressActiveGestureUntilRelease = false
@@ -908,15 +925,19 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
 
         case .ended(let timestampMilliseconds):
             handleEnded(at: timestampMilliseconds, sourceEvent: event)
+            resetContinuousPinchState()
 
         case .deviceEnded(let end):
             handleEnded(at: end.timestampMilliseconds, sourceEvent: event)
+            resetContinuousPinchState()
 
         case .cancelled(let reason, let timestampMilliseconds):
             handleCancelled(reason, at: timestampMilliseconds, sourceEvent: event)
+            resetContinuousPinchState()
 
         case .deviceCancelled(let cancellation):
             handleCancelled(cancellation.reason, at: cancellation.timestampMilliseconds, sourceEvent: event)
+            resetContinuousPinchState()
         }
 
         publishStatus()
@@ -980,7 +1001,9 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
 
     private func handlePinchEnded(_ pinch: CapturedGesturePinch, sourceEvent event: CapturedGestureEvent) {
         timeoutGeneration += 1
+        pinchTimeoutGeneration += 1
         idleDiscardGeneration += 1
+        pendingPinchGesture = nil
         if suppressActiveGestureUntilRelease {
             suppressActiveGestureUntilRelease = false
             updateDebug("pinch \(pinch.direction.rawValue): ignored after idle discard")
@@ -990,6 +1013,17 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         }
         pendingRestoreTap = nil
         guard !cancelForTopologyChangeIfNeeded(at: pinch.timestampMilliseconds) else {
+            return
+        }
+        let capturedInwardSegmentCount = pinch.direction == .inward ? max(1, pinch.inwardSegmentCount) : 0
+        let nextInwardPinchCount = pinch.direction == .inward ? continuousInwardPinchCount + capturedInwardSegmentCount : 0
+        if nextInwardPinchCount >= 2, let quitTarget = lastInwardPinchTarget {
+            continuousInwardPinchCount = nextInwardPinchCount
+            onPreviewEnded()
+            let result = coordinator.dispatch(.quit, to: quitTarget, actionID: pinch.eventID)
+            captureOwnership.releaseOwner(for: event)
+            resetActiveGestureState()
+            updateDebug("pinch \(pinch.direction.rawValue): \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")\(result.commandResult.debugSuffix)")
             return
         }
         if !resolverSessionActive {
@@ -1004,11 +1038,21 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         onPreviewEnded()
         let result = route(.pinchEnded(GesturePinch(
             direction: pinch.direction,
+            inwardSegmentCount: capturedInwardSegmentCount,
             timestampMilliseconds: pinch.timestampMilliseconds,
             eventID: pinch.eventID,
             isCancelled: pinch.isCancelled,
             modifiers: pinch.modifiers
         )), actionID: pinch.eventID)
+        if pinch.direction == .inward,
+           result.resolverOutput.kind == .commit,
+           result.resolverOutput.intent?.command == .close,
+           let target = result.resolverOutput.intent?.target {
+            continuousInwardPinchCount = nextInwardPinchCount
+            lastInwardPinchTarget = target
+        } else {
+            resetContinuousPinchState()
+        }
         captureOwnership.releaseOwner(for: event)
         if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
             onPreviewEnded()
@@ -1018,6 +1062,8 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
     }
 
     private func handleEnded(at timestampMilliseconds: Int, sourceEvent event: CapturedGestureEvent) {
+        pinchTimeoutGeneration += 1
+        pendingPinchGesture = nil
         idleDiscardGeneration += 1
         if suppressActiveGestureUntilRelease {
             suppressActiveGestureUntilRelease = false
@@ -1104,6 +1150,7 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         onPreviewEnded()
         captureOwnership.releaseOwner()
         resetActiveGestureState()
+        resetContinuousPinchState()
         updateDebug("topology changed: cancelled preview")
         publishStatus()
         return true
@@ -1199,6 +1246,37 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         )
     }
 
+    private func updatePendingPinch(from progress: CapturedGestureProgress) {
+        guard case .pinch(let direction) = progress.kind,
+              activeGestureModifierMode == .unmodified
+        else {
+            pendingPinchGesture = nil
+            pinchTimeoutGeneration += 1
+            return
+        }
+
+        let previous = pendingPinchGesture
+        let previousInwardSegments = previous?.inwardSegmentCount ?? 0
+        let inwardSegmentCount: Int
+        switch direction {
+        case .inward:
+            inwardSegmentCount = max(previousInwardSegments, progress.inwardSegmentCount, 1)
+        case .outward:
+            inwardSegmentCount = max(previousInwardSegments, progress.inwardSegmentCount)
+        }
+
+        let resolvedDirection: GesturePinchDirection = inwardSegmentCount > 0 ? .inward : direction
+        let pending = PendingPinchGesture(
+            direction: resolvedDirection,
+            inwardSegmentCount: inwardSegmentCount,
+            pointer: progress.pointer,
+            modifiers: progress.modifiers,
+            timestampMilliseconds: progress.timestampMilliseconds
+        )
+        pendingPinchGesture = pending
+        schedulePinchTimeout(for: pending)
+    }
+
     private func previewCommand(for progress: CapturedGestureProgress) -> KeyboardCommand? {
         switch progress.kind {
         case .stroke(let direction):
@@ -1240,7 +1318,42 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
             guard activeGestureModifierMode == .unmodified else {
                 return nil
             }
+            let activeInwardSegmentCount = max(
+                progress.inwardSegmentCount,
+                pendingPinchGesture?.inwardSegmentCount ?? 0
+            )
+            if direction == .inward, continuousInwardPinchCount > 0 || activeInwardSegmentCount >= 2 {
+                return .quit
+            }
             return direction == .inward ? .close : .toggleFullscreen
+        }
+    }
+
+    private func schedulePinchTimeout(for pending: PendingPinchGesture) {
+        pinchTimeoutGeneration += 1
+        let generation = pinchTimeoutGeneration
+        let delay = min(settings.chainTimeoutMilliseconds, settings.gestureIdleTimeoutMilliseconds)
+        let timeoutTimestamp = pending.timestampMilliseconds + delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+            guard let self,
+                  self.pinchTimeoutGeneration == generation,
+                  let current = self.pendingPinchGesture,
+                  current.timestampMilliseconds == pending.timestampMilliseconds
+            else {
+                return
+            }
+            guard !self.cancelForTopologyChangeIfNeeded(at: timeoutTimestamp) else {
+                return
+            }
+
+            _ = self.coordinator.cancel(.gestureCancelled, at: timeoutTimestamp)
+            self.suppressActiveGestureUntilRelease = true
+            self.captureOwnership.releaseOwner()
+            self.resetActiveGestureState(clearSuppression: false)
+            self.resetContinuousPinchState()
+            self.onPreviewEnded()
+            self.updateDebug("pinch timeout: cancelled")
+            self.publishStatus()
         }
     }
 
@@ -1335,6 +1448,8 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
 
     private func resetActiveGestureState(clearPendingTap: Bool = true, clearSuppression: Bool = true) {
         resolverSessionActive = false
+        pinchTimeoutGeneration += 1
+        pendingPinchGesture = nil
         if clearPendingTap {
             pendingRestoreTap = nil
         }
@@ -1347,11 +1462,24 @@ final class GestureRuntimeController: @preconcurrency LifecycleResource {
         stagedStrokeDirections = []
         lastPresentedPreviewLabel = nil
     }
+
+    private func resetContinuousPinchState() {
+        continuousInwardPinchCount = 0
+        lastInwardPinchTarget = nil
+    }
 }
 
 private struct RestoreTapCandidate {
     var source: CapturedGestureSource
     var target: WindowTargetIdentity
+    var modifiers: Set<ModifierRole>
+    var timestampMilliseconds: Int
+}
+
+private struct PendingPinchGesture: Equatable {
+    var direction: GesturePinchDirection
+    var inwardSegmentCount: Int
+    var pointer: ScreenPoint
     var modifiers: Set<ModifierRole>
     var timestampMilliseconds: Int
 }
@@ -1760,7 +1888,7 @@ private final class GesturePreviewOverlayView: NSView {
             let width = capsule.width * 0.58
             let height = capsule.height * 0.58
             rect = NSRect(x: capsule.midX - width / 2, y: capsule.midY - height / 2, width: width, height: height)
-        case .close:
+        case .close, .quit:
             rect = capsule.insetBy(dx: capsule.width * 0.18, dy: capsule.height * 0.18)
         case .maximize,
              .toggleFullscreen,
@@ -1865,6 +1993,8 @@ private final class GesturePreviewOverlayView: NSView {
         switch command {
         case .close:
             return .close
+        case .quit:
+            return .quit
         case .minimize:
             return .minimize
         case .toggleFullscreen:
@@ -1890,7 +2020,7 @@ private final class GesturePreviewOverlayView: NSView {
         NSColor.white.withAlphaComponent(0.98).setStroke()
         NSColor.white.withAlphaComponent(0.98).setFill()
         switch button {
-        case .close:
+        case .close, .quit:
             drawCloseGlyph(in: rect)
         case .minimize:
             drawMinimizeGlyph(in: rect)
@@ -1965,6 +2095,7 @@ private final class GesturePreviewOverlayView: NSView {
 
 private enum LifecyclePreviewButton {
     case close
+    case quit
     case minimize
     case enterFullscreen
     case exitFullscreen
@@ -1972,6 +2103,8 @@ private enum LifecyclePreviewButton {
     var fillColor: NSColor {
         switch self {
         case .close:
+            return NSColor(calibratedRed: 1.0, green: 0.62, blue: 0.34, alpha: 1.0)
+        case .quit:
             return .systemRed
         case .minimize:
             return .systemBlue

@@ -98,6 +98,7 @@ public struct DesktopSpaceMovementEventPlan: Equatable, Sendable {
 
 public struct MissionControlDesktopSpaceMover: DesktopSpaceMoving {
     public static let titlebarYOffset: CGFloat = 10
+    public static let carryDragDistance: CGFloat = 2
     public static let mouseDownToDragDelaySeconds: TimeInterval = 0.08
     public static let dragToKeyDelaySeconds: TimeInterval = 0.08
     public static let controlToArrowDelaySeconds: TimeInterval = 0.05
@@ -214,9 +215,14 @@ public struct MissionControlDesktopSpaceMover: DesktopSpaceMoving {
             x: frame.x + frame.width / 2,
             y: frame.y + Double(Self.titlebarYOffset)
         )
+        let dragDelta = direction == .left ? -Self.carryDragDistance : Self.carryDragDistance
+        let dragPoint = CGPoint(
+            x: mouseDownPoint.x + dragDelta,
+            y: mouseDownPoint.y
+        )
         return DesktopSpaceMovementEventPlan(
             mouseDownPoint: mouseDownPoint,
-            dragPoint: mouseDownPoint,
+            dragPoint: dragPoint,
             keyCode: direction == .left ? CGKeyCode(kVK_LeftArrow) : CGKeyCode(kVK_RightArrow),
             controlKeyCode: CGKeyCode(kVK_Control),
             eventSourceStateID: Self.eventSourceStateID,

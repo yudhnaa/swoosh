@@ -159,7 +159,7 @@ struct KeyboardCommandTests {
     @Test
     func dispatcherRunsLifecycleAgainstFrontmostTarget() {
         let target = targetIdentity()
-        let lifecycleClient = MockLifecycleClient(supported: [.minimize])
+        let lifecycleClient = MockLifecycleClient(supported: [.minimize, .quit])
         let dispatcher = KeyboardWindowCommandDispatcher(
             targetResolver: MockKeyboardTargetResolver(target: target),
             frameController: MockWindowFrameController(initialFrames: [target: GeometryRect(x: 40, y: 80, width: 900, height: 600)]),
@@ -170,9 +170,11 @@ struct KeyboardCommandTests {
         )
 
         let result = dispatcher.dispatch(.minimize)
+        let quit = dispatcher.dispatch(.quit)
 
         #expect(result.status == .performed)
-        #expect(lifecycleClient.performedActions == [.minimize])
+        #expect(quit.status == .performed)
+        #expect(lifecycleClient.performedActions == [.minimize, .quit])
     }
 
     @Test
@@ -435,8 +437,8 @@ struct KeyboardCommandTests {
         let right = mover.eventPlan(forAppKitFrame: frame, desktopTopY: display.frame.maxY, direction: .right)
         #expect(left.mouseDownPoint == CGPoint(x: 440, y: 312))
         #expect(right.mouseDownPoint == CGPoint(x: 440, y: 312))
-        #expect(left.dragPoint == left.mouseDownPoint)
-        #expect(right.dragPoint == right.mouseDownPoint)
+        #expect(left.dragPoint == CGPoint(x: 440 - MissionControlDesktopSpaceMover.carryDragDistance, y: 312))
+        #expect(right.dragPoint == CGPoint(x: 440 + MissionControlDesktopSpaceMover.carryDragDistance, y: 312))
         #expect(left.keyCode == CGKeyCode(kVK_LeftArrow))
         #expect(right.keyCode == CGKeyCode(kVK_RightArrow))
         #expect(left.controlKeyCode == CGKeyCode(kVK_Control))
@@ -681,6 +683,7 @@ private final class MockDesktopSpaceTargetActivator: DesktopSpaceTargetActivatin
 
 private final class MockLifecycleClient: WindowLifecycleControlling {
     var liveTargets: Set<WindowTargetIdentity>
+    var liveApplications: Set<WindowTargetIdentity>
     var supported: Set<WindowLifecycleAction>
     var results: [WindowLifecycleAction: WindowLifecycleResult]
     var fullscreenStates: [WindowTargetIdentity: Bool]
@@ -688,12 +691,14 @@ private final class MockLifecycleClient: WindowLifecycleControlling {
 
     init(
         liveTargets: Set<WindowTargetIdentity>? = nil,
+        liveApplications: Set<WindowTargetIdentity>? = nil,
         supported: Set<WindowLifecycleAction> = [],
         results: [WindowLifecycleAction: WindowLifecycleResult] = [:],
         fullscreenStates: [WindowTargetIdentity: Bool] = [:]
     ) {
         let defaultTarget = WindowTargetIdentity(processIdentifier: 42, elementIdentifier: "window")
         self.liveTargets = liveTargets ?? [defaultTarget]
+        self.liveApplications = liveApplications ?? self.liveTargets
         self.supported = supported
         self.results = results
         self.fullscreenStates = fullscreenStates
@@ -701,6 +706,10 @@ private final class MockLifecycleClient: WindowLifecycleControlling {
 
     func isAlive(_ target: WindowTargetIdentity) -> Bool {
         liveTargets.contains(target)
+    }
+
+    func isApplicationAlive(_ target: WindowTargetIdentity) -> Bool {
+        liveApplications.contains(target)
     }
 
     func supportedActions(for target: WindowTargetIdentity) -> Set<WindowLifecycleAction> {

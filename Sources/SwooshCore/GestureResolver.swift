@@ -143,6 +143,7 @@ public struct GestureStroke: Equatable, Sendable {
 
 public struct GesturePinch: Equatable, Sendable {
     public var direction: GesturePinchDirection
+    public var inwardSegmentCount: Int
     public var timestampMilliseconds: Int
     public var eventID: String?
     public var isCancelled: Bool
@@ -150,12 +151,14 @@ public struct GesturePinch: Equatable, Sendable {
 
     public init(
         direction: GesturePinchDirection,
+        inwardSegmentCount: Int? = nil,
         timestampMilliseconds: Int,
         eventID: String? = nil,
         isCancelled: Bool = false,
         modifiers: Set<ModifierRole> = []
     ) {
         self.direction = direction
+        self.inwardSegmentCount = inwardSegmentCount ?? (direction == .inward ? 1 : 0)
         self.timestampMilliseconds = timestampMilliseconds
         self.eventID = eventID
         self.isCancelled = isCancelled
@@ -302,7 +305,11 @@ public final class GestureSequenceResolver {
                 return finish(.passThrough)
             }
 
-            let command: KeyboardCommand = pinch.direction == .inward ? .close : .toggleFullscreen
+            let command: KeyboardCommand = if pinch.direction == .inward, pinch.inwardSegmentCount >= 2 {
+                .quit
+            } else {
+                pinch.direction == .inward ? .close : .toggleFullscreen
+            }
             return commit(command, target: active.target, modifierMode: active.modifierMode)
 
         case .release:

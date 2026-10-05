@@ -72,6 +72,7 @@ public struct CapturedGestureStroke: Equatable, Sendable {
 public struct CapturedGesturePinch: Equatable, Sendable {
     public var source: CapturedGestureSource
     public var direction: GesturePinchDirection
+    public var inwardSegmentCount: Int
     public var pointer: ScreenPoint
     public var modifiers: Set<ModifierRole>
     public var timestampMilliseconds: Int
@@ -81,6 +82,7 @@ public struct CapturedGesturePinch: Equatable, Sendable {
     public init(
         source: CapturedGestureSource = .unspecified,
         direction: GesturePinchDirection,
+        inwardSegmentCount: Int? = nil,
         pointer: ScreenPoint,
         modifiers: Set<ModifierRole>,
         timestampMilliseconds: Int,
@@ -89,6 +91,7 @@ public struct CapturedGesturePinch: Equatable, Sendable {
     ) {
         self.source = source
         self.direction = direction
+        self.inwardSegmentCount = inwardSegmentCount ?? (direction == .inward ? 1 : 0)
         self.pointer = pointer
         self.modifiers = modifiers
         self.timestampMilliseconds = timestampMilliseconds
@@ -127,6 +130,7 @@ public enum CapturedGestureProgressKind: Equatable, Sendable {
 public struct CapturedGestureProgress: Equatable, Sendable {
     public var source: CapturedGestureSource
     public var kind: CapturedGestureProgressKind
+    public var inwardSegmentCount: Int
     public var pointer: ScreenPoint
     public var modifiers: Set<ModifierRole>
     public var timestampMilliseconds: Int
@@ -134,12 +138,19 @@ public struct CapturedGestureProgress: Equatable, Sendable {
     public init(
         source: CapturedGestureSource = .unspecified,
         kind: CapturedGestureProgressKind,
+        inwardSegmentCount: Int? = nil,
         pointer: ScreenPoint,
         modifiers: Set<ModifierRole>,
         timestampMilliseconds: Int
     ) {
         self.source = source
         self.kind = kind
+        self.inwardSegmentCount = inwardSegmentCount ?? {
+            if case .pinch(.inward) = kind {
+                return 1
+            }
+            return 0
+        }()
         self.pointer = pointer
         self.modifiers = modifiers
         self.timestampMilliseconds = timestampMilliseconds
@@ -690,6 +701,7 @@ final class BuiltInTrackpadGestureRecognizer {
     private var strokeAnchorCentroid: TouchCentroid?
     private var pendingStrokeDirection: GestureDirection?
     private var pendingPinchDirection: GesturePinchDirection?
+    private var pendingInwardPinchSegments = 0
     private var sequence = 0
     private var segment = 0
     private let pinchThreshold: Double
@@ -703,7 +715,7 @@ final class BuiltInTrackpadGestureRecognizer {
         let extraSensitivitySteps = Double(max(sensitivity - 10, 0))
         let standardPinchThreshold = max(0.010, 0.04 - (standardSensitivitySteps * 0.0035))
         let standardSwipeThreshold = max(0.050, 0.18 - (standardSensitivitySteps * 0.014))
-        pinchThreshold = max(0.004, standardPinchThreshold - (extraSensitivitySteps * 0.0006))
+        pinchThreshold = max(0.004, standardPinchThreshold - (extraSensitivitySteps * 0.0006)) * 1.4
         swipeThreshold = max(0.025, standardSwipeThreshold - (extraSensitivitySteps * 0.003))
     }
 
@@ -717,6 +729,7 @@ final class BuiltInTrackpadGestureRecognizer {
         strokeAnchorCentroid = nil
         pendingStrokeDirection = nil
         pendingPinchDirection = nil
+        pendingInwardPinchSegments = 0
         segment = 0
     }
 
@@ -788,6 +801,21 @@ final class BuiltInTrackpadGestureRecognizer {
             strokeAnchorCentroid = centroid
             pendingStrokeDirection = nil
             pendingPinchDirection = nil
+            pendingInwardPinchSegments = 0
+            return events
+        }
+
+        if let pinchDirection = pendingPinchDirection,
+           (pinchDirection == .inward || pendingInwardPinchSegments > 0),
+           !moved,
+           let lastMovementTimestampMilliseconds,
+           context.timestampMilliseconds - lastMovementTimestampMilliseconds >= strokePauseThresholdMilliseconds {
+            pendingInwardPinchSegments = completedInwardPinchSegments(including: pinchDirection)
+            baseCentroid = centroid
+            lastMovementCentroid = centroid
+            self.lastMovementTimestampMilliseconds = context.timestampMilliseconds
+            pendingPinchDirection = nil
+            strokeAnchorCentroid = nil
             return events
         }
 
@@ -801,9 +829,22 @@ final class BuiltInTrackpadGestureRecognizer {
                     }
                     pendingStrokeDirection = direction
                     pendingPinchDirection = nil
+                    pendingInwardPinchSegments = 0
                     updateStrokeAnchor(for: direction, with: centroid)
                 case .pinch(let direction):
-                    pendingPinchDirection = direction
+                    if let pendingPinchDirection,
+                       pendingPinchDirection != direction,
+                       pendingPinchDirection == .inward,
+                       direction == .outward {
+                        pendingInwardPinchSegments += 1
+                        baseCentroid = centroid
+                        self.pendingPinchDirection = direction
+                    } else if pendingPinchDirection != direction {
+                        baseCentroid = centroid
+                        pendingPinchDirection = direction
+                    } else {
+                        pendingPinchDirection = direction
+                    }
                     pendingStrokeDirection = nil
                     strokeAnchorCentroid = nil
                 }
@@ -827,9 +868,23 @@ final class BuiltInTrackpadGestureRecognizer {
         defer { reset() }
 
         if let pendingPinchDirection {
+            let direction = resolvedPinchDirection(for: pendingPinchDirection)
             return [.pinchEnded(CapturedGesturePinch(
                 source: context.source,
-                direction: pendingPinchDirection,
+                direction: direction,
+                inwardSegmentCount: completedInwardPinchSegments(including: direction),
+                pointer: context.pointer,
+                modifiers: context.modifiers,
+                timestampMilliseconds: context.timestampMilliseconds,
+                eventID: context.eventID(kind: "pinch", parts: "\(sequence)", "\(context.frame)")
+            ))]
+        }
+
+        if pendingInwardPinchSegments > 0 {
+            return [.pinchEnded(CapturedGesturePinch(
+                source: context.source,
+                direction: .inward,
+                inwardSegmentCount: pendingInwardPinchSegments,
                 pointer: context.pointer,
                 modifiers: context.modifiers,
                 timestampMilliseconds: context.timestampMilliseconds,
@@ -870,6 +925,7 @@ final class BuiltInTrackpadGestureRecognizer {
             return [.pinchEnded(CapturedGesturePinch(
                 source: context.source,
                 direction: pinchDirection,
+                inwardSegmentCount: completedInwardPinchSegments(including: pinchDirection),
                 pointer: context.pointer,
                 modifiers: context.modifiers,
                 timestampMilliseconds: context.timestampMilliseconds,
@@ -925,6 +981,7 @@ final class BuiltInTrackpadGestureRecognizer {
             return .changed(CapturedGestureProgress(
                 source: context.source,
                 kind: .pinch(direction),
+                inwardSegmentCount: completedInwardPinchSegments(including: direction),
                 pointer: context.pointer,
                 modifiers: context.modifiers,
                 timestampMilliseconds: context.timestampMilliseconds
@@ -961,6 +1018,31 @@ final class BuiltInTrackpadGestureRecognizer {
             timestampMilliseconds: context.timestampMilliseconds,
             eventID: context.eventID(kind: "stroke", parts: "\(sequence)", "\(segment)", "\(context.frame)")
         ))
+    }
+
+    private func pinchEvent(direction: GesturePinchDirection, context: CaptureRecognitionContext) -> CapturedGestureEvent {
+        segment += 1
+        let direction = resolvedPinchDirection(for: direction)
+        return .pinchEnded(CapturedGesturePinch(
+            source: context.source,
+            direction: direction,
+            inwardSegmentCount: completedInwardPinchSegments(including: direction),
+            pointer: context.pointer,
+            modifiers: context.modifiers,
+            timestampMilliseconds: context.timestampMilliseconds,
+            eventID: context.eventID(kind: "pinch", parts: "\(sequence)", "\(segment)", "\(context.frame)")
+        ))
+    }
+
+    private func completedInwardPinchSegments(including direction: GesturePinchDirection) -> Int {
+        pendingInwardPinchSegments + (direction == .inward ? 1 : 0)
+    }
+
+    private func resolvedPinchDirection(for direction: GesturePinchDirection) -> GesturePinchDirection {
+        if direction == .outward, pendingInwardPinchSegments > 0 {
+            return .inward
+        }
+        return direction
     }
 
     private func hasSignificantMovement(from previous: TouchCentroid?, to current: TouchCentroid) -> Bool {
