@@ -99,7 +99,15 @@ public protocol AccessibilityTargetClient {
     func isAlive(_ identity: WindowTargetIdentity) -> Bool
 }
 
-public struct WindowTargetResolver {
+public protocol WindowTargetResolving {
+    func targetUnderPointer(at point: ScreenPoint) -> Result<WindowTarget, WindowTargetFailure>
+    func targetUnderPointer(
+        at point: ScreenPoint,
+        fallingBackToFrontmost fallbackToFrontmost: Bool
+    ) -> Result<WindowTarget, WindowTargetFailure>
+}
+
+public struct WindowTargetResolver: WindowTargetResolving {
     private let permissions: PermissionSnapshotProviding
     private let client: AccessibilityTargetClient
     private let classifier: WindowTargetClassifying
@@ -115,7 +123,7 @@ public struct WindowTargetResolver {
     }
 
     public func targetUnderPointer(at point: ScreenPoint) -> Result<WindowTarget, WindowTargetFailure> {
-        guard permissions.snapshot().accessibilityTrusted else {
+        guard permissions.isAccessibilityTrusted() else {
             return .failure(.permissionDenied)
         }
 
@@ -142,7 +150,7 @@ public struct WindowTargetResolver {
     }
 
     public func frontmostKeyboardTarget() -> Result<WindowTarget, WindowTargetFailure> {
-        guard permissions.snapshot().accessibilityTrusted else {
+        guard permissions.isAccessibilityTrusted() else {
             return .failure(.permissionDenied)
         }
 
@@ -154,7 +162,7 @@ public struct WindowTargetResolver {
     }
 
     private func frontmostPointerTitlebarTarget(at point: ScreenPoint) -> Result<WindowTarget, WindowTargetFailure> {
-        guard permissions.snapshot().accessibilityTrusted else {
+        guard permissions.isAccessibilityTrusted() else {
             return .failure(.permissionDenied)
         }
 
@@ -300,7 +308,7 @@ public final class WindowTargetSession {
 public struct SystemAccessibilityTargetClient: AccessibilityTargetClient {
     private let messagingTimeout: Float
 
-    public init(messagingTimeout: Float = 2.0) {
+    public init(messagingTimeout: Float = 0.25) {
         self.messagingTimeout = messagingTimeout
     }
 
@@ -373,10 +381,11 @@ public struct SystemAccessibilityTargetClient: AccessibilityTargetClient {
             return nil
         }
 
-        let role = stringAttribute(kAXRoleAttribute, from: element) ?? "unknown"
+        let hierarchy = hierarchySnapshot(from: element)
+        let role = hierarchy.roles.first ?? "unknown"
         let subrole = stringAttribute(kAXSubroleAttribute, from: element)
-        let rolePath = rolePath(from: element)
-        let targetElement = windowAncestor(from: element) ?? element
+        let rolePath = hierarchy.roles
+        let targetElement = hierarchy.window ?? element
         let actions = actionNames(from: targetElement)
         let frame = frameAttribute(from: targetElement)
 
@@ -391,7 +400,7 @@ public struct SystemAccessibilityTargetClient: AccessibilityTargetClient {
         )
     }
 
-    private func rolePath(from element: AXUIElement) -> [String] {
+    private func hierarchySnapshot(from element: AXUIElement) -> (roles: [String], window: AXUIElement?) {
         var roles: [String] = []
         var current: AXUIElement? = element
 
@@ -402,6 +411,9 @@ public struct SystemAccessibilityTargetClient: AccessibilityTargetClient {
 
             if let role = stringAttribute(kAXRoleAttribute, from: currentElement) {
                 roles.append(role)
+                if role == "AXWindow" {
+                    return (roles, currentElement)
+                }
             }
 
             var rawParent: CFTypeRef?
@@ -415,33 +427,7 @@ public struct SystemAccessibilityTargetClient: AccessibilityTargetClient {
             current = parentElement
         }
 
-        return roles
-    }
-
-    private func windowAncestor(from element: AXUIElement) -> AXUIElement? {
-        var current: AXUIElement? = element
-
-        for _ in 0..<12 {
-            guard let currentElement = current else {
-                return nil
-            }
-
-            if stringAttribute(kAXRoleAttribute, from: currentElement) == "AXWindow" {
-                return currentElement
-            }
-
-            var rawParent: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(currentElement, kAXParentAttribute as CFString, &rawParent) == .success,
-                  let parent = rawParent,
-                  let parentElement = axElement(from: parent)
-            else {
-                return nil
-            }
-
-            current = parentElement
-        }
-
-        return nil
+        return (roles, nil)
     }
 
     private func actionNames(from element: AXUIElement) -> Set<String> {

@@ -90,6 +90,97 @@ struct SettingsStoreTests {
     }
 
     @Test
+    func loadMigratesLegacySuiteOnceWithoutRemovingLegacySettings() throws {
+        let currentFixture = UserDefaultsFixture()
+        let legacyFixture = UserDefaultsFixture()
+        defer {
+            currentFixture.cleanup()
+            legacyFixture.cleanup()
+        }
+
+        var legacySettings = SwooshSettings.defaults
+        legacySettings.isPaused = true
+        let legacyStore = UserDefaultsSettingsStore(defaults: legacyFixture.defaults)
+        try legacyStore.save(legacySettings)
+        let originalLegacyData = try #require(legacyStore.rawStoredData())
+
+        let store = UserDefaultsSettingsStore(
+            defaults: currentFixture.defaults,
+            legacyDefaults: legacyFixture.defaults
+        )
+
+        #expect(store.load().isPaused)
+        #expect(store.rawStoredData() == originalLegacyData)
+        #expect(legacyStore.rawStoredData() == originalLegacyData)
+        #expect(
+            currentFixture.defaults.string(forKey: UserDefaultsSettingsStore.legacyMigrationMarkerKey)
+                == UserDefaultsSettingsStore.legacySuiteName
+        )
+
+        var changedLegacySettings = legacySettings
+        changedLegacySettings.isPaused = false
+        try legacyStore.save(changedLegacySettings)
+
+        #expect(store.load().isPaused)
+    }
+
+    @Test
+    func migrationDoesNotOverwriteSettingsAlreadyStoredInCurrentDomain() throws {
+        let currentFixture = UserDefaultsFixture()
+        let legacyFixture = UserDefaultsFixture()
+        defer {
+            currentFixture.cleanup()
+            legacyFixture.cleanup()
+        }
+
+        var currentSettings = SwooshSettings.defaults
+        currentSettings.overlayPreviewSize = .small
+        try UserDefaultsSettingsStore(defaults: currentFixture.defaults).save(currentSettings)
+
+        var legacySettings = SwooshSettings.defaults
+        legacySettings.overlayPreviewSize = .large
+        try UserDefaultsSettingsStore(defaults: legacyFixture.defaults).save(legacySettings)
+
+        let store = UserDefaultsSettingsStore(
+            defaults: currentFixture.defaults,
+            legacyDefaults: legacyFixture.defaults
+        )
+
+        #expect(store.load().overlayPreviewSize == .small)
+        #expect(
+            currentFixture.defaults.string(forKey: UserDefaultsSettingsStore.legacyMigrationMarkerKey)
+                == UserDefaultsSettingsStore.legacySuiteName
+        )
+    }
+
+    @Test
+    func migrationAttemptIsMarkedEvenWhenLegacySuiteHasNoSettings() throws {
+        let currentFixture = UserDefaultsFixture()
+        let legacyFixture = UserDefaultsFixture()
+        defer {
+            currentFixture.cleanup()
+            legacyFixture.cleanup()
+        }
+
+        let store = UserDefaultsSettingsStore(
+            defaults: currentFixture.defaults,
+            legacyDefaults: legacyFixture.defaults
+        )
+
+        #expect(store.load() == .defaults)
+        #expect(
+            currentFixture.defaults.string(forKey: UserDefaultsSettingsStore.legacyMigrationMarkerKey)
+                == UserDefaultsSettingsStore.legacySuiteName
+        )
+
+        var lateLegacySettings = SwooshSettings.defaults
+        lateLegacySettings.isPaused = true
+        try UserDefaultsSettingsStore(defaults: legacyFixture.defaults).save(lateLegacySettings)
+
+        #expect(store.load() == .defaults)
+    }
+
+    @Test
     func restoreDefaultsDoesNotTouchUnrelatedSystemPreferenceKeys() throws {
         let fixture = UserDefaultsFixture()
         defer { fixture.cleanup() }

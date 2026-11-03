@@ -1,9 +1,11 @@
 import Foundation
 
+@MainActor
 public protocol LifecycleResource: AnyObject {
     func shutdown()
 }
 
+@MainActor
 public final class LifecycleCoordinator {
     private var resources: [LifecycleResource] = []
     private var hasShutdown = false

@@ -12,6 +12,19 @@ struct WindowTargetResolverTests {
     }
 
     @Test
+    func targetingUsesAccessibilityFastPathWithoutTakingFullSnapshot() {
+        let permissions = SnapshotCountingPermissionProvider(accessibilityTrusted: true)
+        let resolver = WindowTargetResolver(
+            permissions: permissions,
+            client: MockAccessibilityClient()
+        )
+
+        #expect(resolver.targetUnderPointer(at: ScreenPoint(x: 10, y: 10)).failureValue == .noTarget)
+        #expect(permissions.accessibilityReadCount == 1)
+        #expect(permissions.snapshotReadCount == 0)
+    }
+
+    @Test
     func pointerResolutionAcceptsTitlebarRelatedWindowChrome() throws {
         let chrome = element(role: "AXToolbar", path: ["AXToolbar", "AXWindow", "AXApplication"], frame: windowFrame)
         let resolver = makeResolver(hitTest: chrome)
@@ -275,6 +288,30 @@ private struct StaticPermissionProvider: PermissionSnapshotProviding {
                 started: false,
                 reason: "available"
             )
+        )
+    }
+}
+
+private final class SnapshotCountingPermissionProvider: PermissionSnapshotProviding {
+    private(set) var accessibilityReadCount = 0
+    private(set) var snapshotReadCount = 0
+    private let accessibilityTrusted: Bool
+
+    init(accessibilityTrusted: Bool) {
+        self.accessibilityTrusted = accessibilityTrusted
+    }
+
+    func isAccessibilityTrusted() -> Bool {
+        accessibilityReadCount += 1
+        return accessibilityTrusted
+    }
+
+    func snapshot() -> PermissionDiagnostics {
+        snapshotReadCount += 1
+        return PermissionDiagnostics(
+            accessibilityTrusted: accessibilityTrusted,
+            inputMonitoringTrusted: true,
+            privateMultitouch: .unavailable
         )
     }
 }

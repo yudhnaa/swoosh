@@ -157,9 +157,30 @@ struct KeyboardCommandTests {
     }
 
     @Test
+    func snapAndMaximizeUseTheDisplayContainingTheTargetWindow() {
+        let target = targetIdentity()
+        let initialFrame = GeometryRect(x: 1700, y: 20, width: 900, height: 600)
+        let frames = MockWindowFrameController(initialFrames: [target: initialFrame])
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: frames,
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            displayProvider: { self.display },
+            displayListProvider: { [self.display, self.externalDisplay] },
+            gridSpacingProvider: { 24 }
+        )
+
+        let result = dispatcher.dispatch(.maximize)
+
+        #expect(result.status == .performed)
+        #expect(result.requestedFrame == externalDisplay.usableFrame)
+        #expect(frames.frames[target] == externalDisplay.usableFrame)
+    }
+
+    @Test
     func dispatcherRunsLifecycleAgainstFrontmostTarget() {
         let target = targetIdentity()
-        let lifecycleClient = MockLifecycleClient(supported: [.minimize])
+        let lifecycleClient = MockLifecycleClient(supported: [.minimize, .quit])
         let dispatcher = KeyboardWindowCommandDispatcher(
             targetResolver: MockKeyboardTargetResolver(target: target),
             frameController: MockWindowFrameController(initialFrames: [target: GeometryRect(x: 40, y: 80, width: 900, height: 600)]),
@@ -170,9 +191,11 @@ struct KeyboardCommandTests {
         )
 
         let result = dispatcher.dispatch(.minimize)
+        let quit = dispatcher.dispatch(.quit)
 
         #expect(result.status == .performed)
-        #expect(lifecycleClient.performedActions == [.minimize])
+        #expect(quit.status == .performed)
+        #expect(lifecycleClient.performedActions == [.minimize, .quit])
     }
 
     @Test
@@ -388,6 +411,29 @@ struct KeyboardCommandTests {
     }
 
     @Test
+    func asyncDispatcherUsesAsyncDesktopSpaceMoverWithoutSyncFallback() async {
+        let target = targetIdentity()
+        let mover = AsyncTrackingDesktopSpaceMover()
+        let dispatcher = KeyboardWindowCommandDispatcher(
+            targetResolver: MockKeyboardTargetResolver(target: target),
+            frameController: MockWindowFrameController(initialFrames: [
+                target: GeometryRect(x: 40, y: 80, width: 900, height: 600)
+            ]),
+            lifecycleController: WindowLifecycleController(client: MockLifecycleClient()),
+            desktopSpaceMover: mover,
+            displayProvider: { display },
+            displayListProvider: { [display] },
+            gridSpacingProvider: { 0 }
+        )
+
+        let result = await dispatcher.dispatch(.moveSpaceLeft, to: target)
+
+        #expect(result.status == .performed)
+        #expect(mover.asyncCallCount == 1)
+        #expect(mover.syncCallCount == 0)
+    }
+
+    @Test
     func dispatcherReportsUnavailableForUnsupportedDesktopSpaceDirection() {
         let target = targetIdentity()
         let frame = GeometryRect(x: 120, y: 200, width: 640, height: 480)
@@ -416,7 +462,12 @@ struct KeyboardCommandTests {
     @Test
     func missionControlSpaceMoverPlansGestureTargetControlArrowSequence() {
         let activator = MockDesktopSpaceTargetActivator()
-        let mover = MissionControlDesktopSpaceMover(targetActivator: activator)
+        var events: [CGEvent] = []
+        let mover = MissionControlDesktopSpaceMover(
+            targetActivator: activator,
+            timing: ImmediateDesktopSpaceTiming(),
+            postEvent: { event, _ in events.append(event) },
+        )
         let target = targetIdentity(id: "pointer-window")
         let frame = GeometryRect(x: 120, y: 200, width: 640, height: 480)
 
@@ -430,13 +481,16 @@ struct KeyboardCommandTests {
         #expect(result.status == .performed)
         #expect(result.reason == nil)
         #expect(activator.activatedTargets == [target])
+        #expect(events.map(\.type) == [
+            .leftMouseDown, .leftMouseDragged, .flagsChanged, .keyDown, .keyUp, .leftMouseUp, .flagsChanged
+        ])
 
         let left = mover.eventPlan(forAppKitFrame: frame, desktopTopY: display.frame.maxY, direction: .left)
         let right = mover.eventPlan(forAppKitFrame: frame, desktopTopY: display.frame.maxY, direction: .right)
         #expect(left.mouseDownPoint == CGPoint(x: 440, y: 312))
         #expect(right.mouseDownPoint == CGPoint(x: 440, y: 312))
-        #expect(left.dragPoint == left.mouseDownPoint)
-        #expect(right.dragPoint == right.mouseDownPoint)
+        #expect(left.dragPoint == CGPoint(x: 440 - MissionControlDesktopSpaceMover.carryDragDistance, y: 312))
+        #expect(right.dragPoint == CGPoint(x: 440 + MissionControlDesktopSpaceMover.carryDragDistance, y: 312))
         #expect(left.keyCode == CGKeyCode(kVK_LeftArrow))
         #expect(right.keyCode == CGKeyCode(kVK_RightArrow))
         #expect(left.controlKeyCode == CGKeyCode(kVK_Control))
@@ -456,6 +510,114 @@ struct KeyboardCommandTests {
     }
 
     @Test
+    func missionControlSpaceMoverUsesInjectedTimingProfileInOrder() {
+        let profile = DesktopSpaceTimingProfile(
+            targetActivationDelaySeconds: 1,
+            mouseDownToDragDelaySeconds: 2,
+            dragToKeyDelaySeconds: 3,
+            controlToArrowDelaySeconds: 4,
+            keyToMouseUpDelaySeconds: 5
+        )
+        let timing = RecordingDesktopSpaceTiming()
+        let mover = MissionControlDesktopSpaceMover(
+            targetActivator: MockDesktopSpaceTargetActivator(),
+            timingProfile: profile,
+            timing: timing,
+            postEvent: { _, _ in }
+        )
+
+        let result = mover.moveWindow(
+            target: targetIdentity(),
+            frame: GeometryRect(x: 120, y: 200, width: 640, height: 480),
+            direction: .right,
+            desktopTopY: display.frame.maxY
+        )
+
+        #expect(result.status == .performed)
+        #expect(timing.waits == [1, 2, 3, 4, 5])
+    }
+
+    @Test
+    func missionControlSpaceMoverDoesNotRunDiagnosticsWhileMouseIsHeld() {
+        let diagnostics = RecordingDesktopSpaceDiagnosticsSink()
+        let mover = MissionControlDesktopSpaceMover(
+            targetActivator: MockDesktopSpaceTargetActivator(),
+            timing: ImmediateDesktopSpaceTiming(),
+            diagnosticsSink: diagnostics,
+            postEvent: { _, _ in }
+        )
+
+        let result = mover.moveWindow(
+            target: targetIdentity(),
+            frame: GeometryRect(x: 120, y: 200, width: 640, height: 480),
+            direction: .left,
+            desktopTopY: display.frame.maxY
+        )
+
+        #expect(result.status == .performed)
+        #expect(diagnostics.session.stages == [
+            "capture:beforeActivation", "write:activation", "capture:baselineTitlebar",
+            "write:dragPointResolution", "capture:beforeMouseDown", "write:mouseEvents",
+            "capture:afterRelease"
+        ])
+    }
+
+    @Test
+    func missionControlSpaceMoverRejectsOverlappingMove() {
+        let timing = HookDesktopSpaceTiming()
+        let box = DesktopSpaceMoverBox()
+        var overlapResult: DesktopSpaceMovementResult?
+        let mover = MissionControlDesktopSpaceMover(
+            targetActivator: MockDesktopSpaceTargetActivator(),
+            timing: timing,
+            postEvent: { _, _ in }
+        )
+        box.mover = mover
+        timing.onFirstWait = {
+            overlapResult = box.mover?.moveWindow(
+                target: self.targetIdentity(id: "overlap"),
+                frame: GeometryRect(x: 120, y: 200, width: 640, height: 480),
+                direction: .right,
+                desktopTopY: self.display.frame.maxY
+            )
+        }
+
+        let result = mover.moveWindow(
+            target: targetIdentity(),
+            frame: GeometryRect(x: 120, y: 200, width: 640, height: 480),
+            direction: .left,
+            desktopTopY: display.frame.maxY
+        )
+
+        #expect(result.status == .performed)
+        #expect(overlapResult?.status == .unavailable)
+        #expect(overlapResult?.reason == "A Desktop Spaces movement is already in progress.")
+    }
+
+    @Test
+    func missionControlSpaceMoverReleasesMouseAndControlAfterPostingFailure() {
+        var posted: [CGEventType] = []
+        let mover = MissionControlDesktopSpaceMover(
+            targetActivator: MockDesktopSpaceTargetActivator(),
+            timing: ImmediateDesktopSpaceTiming(),
+            postEvent: { event, _ in
+                posted.append(event.type)
+                if event.type == .keyDown { throw DesktopSpaceTestError.postFailed }
+            }
+        )
+
+        let result = mover.moveWindow(
+            target: targetIdentity(),
+            frame: GeometryRect(x: 120, y: 200, width: 640, height: 480),
+            direction: .right,
+            desktopTopY: display.frame.maxY
+        )
+
+        #expect(result.status == .failed)
+        #expect(posted == [.leftMouseDown, .leftMouseDragged, .flagsChanged, .keyDown, .leftMouseUp, .flagsChanged])
+    }
+
+    @Test
     func missionControlSpaceMoverReportsUnavailableWhenTargetCannotActivate() {
         let activator = MockDesktopSpaceTargetActivator(result: .failed("mock activation failed"))
         let mover = MissionControlDesktopSpaceMover(targetActivator: activator)
@@ -471,6 +633,110 @@ struct KeyboardCommandTests {
         #expect(result.status == .unavailable)
         #expect(result.reason == "mock activation failed")
         #expect(activator.activatedTargets == [target])
+    }
+
+    @Test(arguments: [DesktopSpaceMoveDirection.left, .right])
+    func customTitlebarUsesResolvedPointWithExactlyTwoPixelDrag(direction: DesktopSpaceMoveDirection) {
+        let activator = MockDesktopSpaceTargetActivator()
+        activator.dragPointResult = DesktopSpaceDragPointResult(point: CGPoint(x: 202, y: 312), reason: "AXWindowBackground")
+        var events: [CGEvent] = []
+        let mover = MissionControlDesktopSpaceMover(
+            targetActivator: activator,
+            timing: ImmediateDesktopSpaceTiming(),
+            postEvent: { event, _ in events.append(event) }
+        )
+        let result = mover.moveWindow(
+            target: targetIdentity(), frame: GeometryRect(x: 120, y: 200, width: 640, height: 480),
+            direction: direction, desktopTopY: display.frame.maxY
+        )
+        #expect(result.status == .performed)
+        #expect(events.count == 7)
+        #expect(events.first?.location == CGPoint(x: 202, y: 312))
+        #expect(events[1].location == CGPoint(x: direction == .left ? 200 : 204, y: 312))
+        #expect(events[5].location == events[1].location)
+        #expect(events[3].flags == [.maskControl, .maskSecondaryFn, .maskNumericPad])
+        #expect(events.last?.flags == [])
+    }
+
+    @Test
+    func customTitlebarFailureDoesNotClickOrSwitchSpaces() {
+        let activator = MockDesktopSpaceTargetActivator()
+        activator.dragPointResult = DesktopSpaceDragPointResult(point: nil, reason: "No window background")
+        var eventCount = 0
+        let mover = MissionControlDesktopSpaceMover(
+            targetActivator: activator,
+            timing: ImmediateDesktopSpaceTiming(),
+            postEvent: { _, _ in eventCount += 1 }
+        )
+        let result = mover.moveWindow(
+            target: targetIdentity(), frame: GeometryRect(x: 120, y: 200, width: 640, height: 480),
+            direction: .right, desktopTopY: display.frame.maxY
+        )
+        #expect(result.status == .unavailable)
+        #expect(result.reason == "No window background")
+        #expect(eventCount == 0)
+    }
+
+    @Test
+    func customTitlebarSelectorAvoidsCenterControlAndUsesTrafficLightGap() {
+        let frame = CGRect(x: -1200, y: 140, width: 1000, height: 700)
+        let baseline = CGPoint(x: -700, y: 150)
+        let buttons = [CGRect(x: -1190, y: 146, width: 14, height: 14),
+                       CGRect(x: -1170, y: 146, width: 14, height: 14),
+                       CGRect(x: -1150, y: 146, width: 14, height: 14)]
+        let selected = DesktopSpaceDragPointSelector.select(
+            frame: frame, defaultPoint: baseline, buttons: buttons, direction: .right,
+            isWindowBackground: { $0.x < -1100 }
+        )
+        #expect(selected == CGPoint(x: -1128, y: 150))
+    }
+
+    @Test
+    func customTitlebarSelectorPreservesWorkingBaselineAndRejectsBlockedDragEndpoint() {
+        let frame = CGRect(x: 100, y: 100, width: 800, height: 600)
+        let baseline = CGPoint(x: 500, y: 110)
+        #expect(DesktopSpaceDragPointSelector.select(
+            frame: frame, defaultPoint: baseline, buttons: [], direction: .left,
+            isWindowBackground: { _ in true }
+        ) == baseline)
+        #expect(DesktopSpaceDragPointSelector.select(
+            frame: frame, defaultPoint: baseline, buttons: [], direction: .left,
+            isWindowBackground: { $0 == baseline }
+        ) == nil)
+        #expect(DesktopSpaceDragPointSelector.select(
+            frame: frame, defaultPoint: baseline, buttons: [frame], direction: .right,
+            isWindowBackground: { _ in true }
+        ) == nil)
+    }
+
+    @Test
+    func braveTitlebarFallbackUsesTrafficLightAdjacentStripWithoutButtonFrames() {
+        let frame = CGRect(x: 0, y: 38, width: 1512, height: 944)
+        let selected = DesktopSpaceDragPointSelector.select(
+            frame: frame,
+            defaultPoint: CGPoint(x: frame.midX, y: frame.minY + 10),
+            buttons: [],
+            direction: .right,
+            isWindowBackground: { point in point.x >= 76 && point.x <= 110 }
+        )
+
+        #expect(selected == CGPoint(x: 76, y: 48))
+    }
+
+    @Test
+    func braveCustomTitlebarAcceptsOnlyNonActionableTargetChrome() {
+        #expect(DesktopSpaceDragPointSelector.isEligibleCustomTitlebarHit(
+            role: "AXGroup", actions: [], belongsToTargetWindow: true
+        ))
+        #expect(DesktopSpaceDragPointSelector.isEligibleCustomTitlebarHit(
+            role: "AXToolbar", actions: [], belongsToTargetWindow: true
+        ))
+        #expect(!DesktopSpaceDragPointSelector.isEligibleCustomTitlebarHit(
+            role: "AXButton", actions: [kAXPressAction], belongsToTargetWindow: true
+        ))
+        #expect(!DesktopSpaceDragPointSelector.isEligibleCustomTitlebarHit(
+            role: "AXGroup", actions: [], belongsToTargetWindow: false
+        ))
     }
 
     @Test
@@ -641,6 +907,62 @@ private struct DesktopSpaceMoveRequest: Equatable {
     var desktopTopY: Double
 }
 
+private final class ImmediateDesktopSpaceTiming: DesktopSpaceTiming {
+    func wait(for duration: TimeInterval, isCancelled: () -> Bool) throws {
+        if isCancelled() { throw CancellationError() }
+    }
+}
+
+private final class RecordingDesktopSpaceTiming: DesktopSpaceTiming {
+    private(set) var waits: [TimeInterval] = []
+
+    func wait(for duration: TimeInterval, isCancelled: () -> Bool) throws {
+        waits.append(duration)
+        if isCancelled() { throw CancellationError() }
+    }
+}
+
+private final class HookDesktopSpaceTiming: DesktopSpaceTiming {
+    var onFirstWait: (() -> Void)?
+    private var didRunHook = false
+
+    func wait(for duration: TimeInterval, isCancelled: () -> Bool) throws {
+        if !didRunHook {
+            didRunHook = true
+            onFirstWait?()
+        }
+        if isCancelled() { throw CancellationError() }
+    }
+}
+
+private final class DesktopSpaceMoverBox {
+    var mover: MissionControlDesktopSpaceMover?
+}
+
+private final class RecordingDesktopSpaceDiagnosticsSession: DesktopSpaceDiagnosticsSession {
+    private(set) var stages: [String] = []
+
+    func write(_ stage: String, details: [String: String]) {
+        stages.append("write:\(stage)")
+    }
+
+    func capture(_ stage: String, plan: DesktopSpaceMovementEventPlan?) {
+        stages.append("capture:\(stage)")
+    }
+}
+
+private final class RecordingDesktopSpaceDiagnosticsSink: DesktopSpaceDiagnosticsSink {
+    let session = RecordingDesktopSpaceDiagnosticsSession()
+
+    func makeSession(for target: WindowTargetIdentity) -> any DesktopSpaceDiagnosticsSession {
+        session
+    }
+}
+
+private enum DesktopSpaceTestError: Error {
+    case postFailed
+}
+
 private final class MockDesktopSpaceMover: DesktopSpaceMoving {
     var results: [DesktopSpaceMoveDirection: DesktopSpaceMovementResult]
     private(set) var requests: [DesktopSpaceMoveRequest] = []
@@ -665,8 +987,50 @@ private final class MockDesktopSpaceMover: DesktopSpaceMoving {
     }
 }
 
+private final class AsyncTrackingDesktopSpaceMover: DesktopSpaceMoving, @unchecked Sendable {
+    private let lock = NSLock()
+    private var asyncCalls = 0
+    private var syncCalls = 0
+
+    var asyncCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return asyncCalls
+    }
+
+    var syncCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return syncCalls
+    }
+
+    func moveWindow(
+        target: WindowTargetIdentity,
+        frame: GeometryRect,
+        direction: DesktopSpaceMoveDirection,
+        desktopTopY: Double
+    ) async -> DesktopSpaceMovementResult {
+        lock.withLock { asyncCalls += 1 }
+        await Task.yield()
+        return DesktopSpaceMovementResult(status: .performed)
+    }
+
+    func moveWindow(
+        target: WindowTargetIdentity,
+        frame: GeometryRect,
+        direction: DesktopSpaceMoveDirection,
+        desktopTopY: Double
+    ) -> DesktopSpaceMovementResult {
+        lock.lock()
+        syncCalls += 1
+        lock.unlock()
+        return DesktopSpaceMovementResult(status: .performed)
+    }
+}
+
 private final class MockDesktopSpaceTargetActivator: DesktopSpaceTargetActivating {
     var result: DesktopSpaceTargetActivationResult
+    var dragPointResult: DesktopSpaceDragPointResult?
     private(set) var activatedTargets: [WindowTargetIdentity] = []
 
     init(result: DesktopSpaceTargetActivationResult = .success) {
@@ -677,10 +1041,15 @@ private final class MockDesktopSpaceTargetActivator: DesktopSpaceTargetActivatin
         activatedTargets.append(target)
         return result
     }
+
+    func dragPoint(for target: WindowTargetIdentity, defaultPoint: CGPoint, direction: DesktopSpaceMoveDirection) -> DesktopSpaceDragPointResult {
+        dragPointResult ?? DesktopSpaceDragPointResult(point: defaultPoint, reason: "standardTitlebar")
+    }
 }
 
 private final class MockLifecycleClient: WindowLifecycleControlling {
     var liveTargets: Set<WindowTargetIdentity>
+    var liveApplications: Set<WindowTargetIdentity>
     var supported: Set<WindowLifecycleAction>
     var results: [WindowLifecycleAction: WindowLifecycleResult]
     var fullscreenStates: [WindowTargetIdentity: Bool]
@@ -688,12 +1057,14 @@ private final class MockLifecycleClient: WindowLifecycleControlling {
 
     init(
         liveTargets: Set<WindowTargetIdentity>? = nil,
+        liveApplications: Set<WindowTargetIdentity>? = nil,
         supported: Set<WindowLifecycleAction> = [],
         results: [WindowLifecycleAction: WindowLifecycleResult] = [:],
         fullscreenStates: [WindowTargetIdentity: Bool] = [:]
     ) {
         let defaultTarget = WindowTargetIdentity(processIdentifier: 42, elementIdentifier: "window")
         self.liveTargets = liveTargets ?? [defaultTarget]
+        self.liveApplications = liveApplications ?? self.liveTargets
         self.supported = supported
         self.results = results
         self.fullscreenStates = fullscreenStates
@@ -701,6 +1072,10 @@ private final class MockLifecycleClient: WindowLifecycleControlling {
 
     func isAlive(_ target: WindowTargetIdentity) -> Bool {
         liveTargets.contains(target)
+    }
+
+    func isApplicationAlive(_ target: WindowTargetIdentity) -> Bool {
+        liveApplications.contains(target)
     }
 
     func supportedActions(for target: WindowTargetIdentity) -> Set<WindowLifecycleAction> {

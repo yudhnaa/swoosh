@@ -484,6 +484,8 @@ public extension KeyboardCommand {
             "Minimize"
         case .close:
             "Close"
+        case .quit:
+            "Quit"
         case .toggleFullscreen:
             "Toggle Full Screen"
         case .moveDisplayLeft:

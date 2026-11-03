@@ -36,6 +36,7 @@ public enum KeyboardCommand: String, Codable, CaseIterable, Hashable, Sendable {
     case centerAndUnsnap
     case minimize
     case close
+    case quit
     case toggleFullscreen
     case moveDisplayLeft
     case moveDisplayRight

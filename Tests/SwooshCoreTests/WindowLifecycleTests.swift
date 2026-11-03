@@ -51,6 +51,24 @@ struct WindowLifecycleTests {
     }
 
     @Test
+    func quitCanRunWhenApplicationIsAliveAfterWindowIsGone() {
+        let target = targetIdentity()
+        let client = MockLifecycleClient(
+            liveTargets: [],
+            liveApplications: [target],
+            supported: [.quit]
+        )
+        let controller = WindowLifecycleController(client: client)
+
+        #expect(controller.supportedActions(for: target) == [.quit])
+
+        let result = controller.perform(.quit, for: target)
+
+        #expect(result.status == .performed)
+        #expect(client.performedActions == [.quit])
+    }
+
+    @Test
     func rejectedClientResultPropagatesReason() {
         let target = targetIdentity()
         let client = MockLifecycleClient(
@@ -144,6 +162,7 @@ struct WindowLifecycleTests {
 
 private final class MockLifecycleClient: WindowLifecycleControlling {
     var liveTargets: Set<WindowTargetIdentity>
+    var liveApplications: Set<WindowTargetIdentity>
     var supported: Set<WindowLifecycleAction>
     var results: [WindowLifecycleAction: WindowLifecycleResult]
     var fullscreenStates: [WindowTargetIdentity: Bool]
@@ -151,12 +170,14 @@ private final class MockLifecycleClient: WindowLifecycleControlling {
 
     init(
         liveTargets: Set<WindowTargetIdentity>? = nil,
+        liveApplications: Set<WindowTargetIdentity>? = nil,
         supported: Set<WindowLifecycleAction> = [],
         results: [WindowLifecycleAction: WindowLifecycleResult] = [:],
         fullscreenStates: [WindowTargetIdentity: Bool] = [:]
     ) {
         let defaultTarget = WindowTargetIdentity(processIdentifier: 42, elementIdentifier: "window")
         self.liveTargets = liveTargets ?? [defaultTarget]
+        self.liveApplications = liveApplications ?? self.liveTargets
         self.supported = supported
         self.results = results
         self.fullscreenStates = fullscreenStates
@@ -164,6 +185,10 @@ private final class MockLifecycleClient: WindowLifecycleControlling {
 
     func isAlive(_ target: WindowTargetIdentity) -> Bool {
         liveTargets.contains(target)
+    }
+
+    func isApplicationAlive(_ target: WindowTargetIdentity) -> Bool {
+        liveApplications.contains(target)
     }
 
     func supportedActions(for target: WindowTargetIdentity) -> Set<WindowLifecycleAction> {

@@ -24,7 +24,7 @@ public struct GestureInputResult: Equatable, Sendable {
 }
 
 public final class GestureInputCoordinator {
-    private let dispatcher: WindowCommandDispatching
+    private let dispatcher: WindowCommandDispatching?
     private var resolver: GestureSequenceResolver
     private var settings: SwooshSettings
     private var status: GestureInputStatus = .stopped
@@ -33,7 +33,7 @@ public final class GestureInputCoordinator {
 
     public init(
         settings: SwooshSettings = .defaults,
-        dispatcher: WindowCommandDispatching
+        dispatcher: WindowCommandDispatching? = nil
     ) {
         let normalized = settings.normalized
         self.settings = normalized
@@ -47,6 +47,10 @@ public final class GestureInputCoordinator {
 
     public var currentFailureReason: GestureInputFailureReason? {
         failureReason
+    }
+
+    public var resolverSnapshot: GestureResolverSnapshot {
+        resolver.snapshot
     }
 
     public func start(permissionReady: Bool, captureReady: Bool) {
@@ -70,7 +74,7 @@ public final class GestureInputCoordinator {
 
     public func updateSettings(_ next: SwooshSettings) {
         settings = next.normalized
-        resolver = GestureSequenceResolver(settings: settings)
+        _ = resolver.updateConfiguration(GestureResolverConfiguration(settings: settings))
         if settings.isPaused {
             pause()
         } else if status == .paused {
@@ -96,6 +100,14 @@ public final class GestureInputCoordinator {
         failureReason = .listenerFailed
     }
 
+    public func listenerRecovered() {
+        guard status == .failed, failureReason == .listenerFailed else {
+            return
+        }
+        status = settings.isPaused ? .paused : .running
+        failureReason = nil
+    }
+
     public func cancel(_ reason: GestureCancelReason, at timestamp: Int) -> GestureInputResult {
         GestureInputResult(resolverOutput: resolver.process(.cancel(reason, timestampMilliseconds: timestamp)))
     }
@@ -108,15 +120,21 @@ public final class GestureInputCoordinator {
     }
 
     public func isFullscreen(_ target: WindowTargetIdentity) -> Bool? {
-        (dispatcher as? WindowFullscreenStateProviding)?.isFullscreen(target)
+        guard let dispatcher else { return nil }
+        return (dispatcher as? WindowFullscreenStateProviding)?.isFullscreen(target)
     }
 
     public func displayMovementPreview(for command: KeyboardCommand, target: WindowTargetIdentity) -> DisplayMovementPreviewContext? {
-        (dispatcher as? WindowDisplayMovementPreviewProviding)?.displayMovementPreview(for: command, target: target)
+        guard let dispatcher else { return nil }
+        return (dispatcher as? WindowDisplayMovementPreviewProviding)?.displayMovementPreview(for: command, target: target)
     }
 
     @discardableResult
-    public func handle(_ event: GestureResolverEvent, actionID: String? = nil) -> GestureInputResult {
+    public func handle(
+        _ event: GestureResolverEvent,
+        actionID: String? = nil,
+        performEffects: Bool = true
+    ) -> GestureInputResult {
         guard status == .running, settings.gesturesEnabled else {
             return GestureInputResult(resolverOutput: .passThrough)
         }
@@ -133,7 +151,7 @@ public final class GestureInputCoordinator {
             lastActionID = actionID
         }
 
-        let commandResult = dispatcher.dispatch(intent.command, to: intent.target)
+        let commandResult = performEffects ? dispatcher?.dispatch(intent.command, to: intent.target) : nil
         return GestureInputResult(resolverOutput: output, commandResult: commandResult)
     }
 
@@ -142,7 +160,8 @@ public final class GestureInputCoordinator {
         _ command: KeyboardCommand,
         to target: WindowTargetIdentity,
         modifierMode: GestureModifierMode = .unmodified,
-        actionID: String? = nil
+        actionID: String? = nil,
+        performEffects: Bool = true
     ) -> GestureInputResult {
         guard status == .running, settings.gesturesEnabled else {
             return GestureInputResult(resolverOutput: .passThrough)
@@ -164,7 +183,7 @@ public final class GestureInputCoordinator {
                 modifierMode: modifierMode
             )
         )
-        let commandResult = dispatcher.dispatch(command, to: target)
+        let commandResult = performEffects ? dispatcher?.dispatch(command, to: target) : nil
         return GestureInputResult(resolverOutput: output, commandResult: commandResult)
     }
 }

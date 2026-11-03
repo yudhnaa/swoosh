@@ -104,6 +104,13 @@ public struct PrivateCaptureDiagnostics: Equatable, Sendable {
 
 public protocol PermissionSnapshotProviding {
     func snapshot() -> PermissionDiagnostics
+    func isAccessibilityTrusted() -> Bool
+}
+
+public extension PermissionSnapshotProviding {
+    func isAccessibilityTrusted() -> Bool {
+        snapshot().accessibilityTrusted
+    }
 }
 
 public struct SystemPermissionSnapshotProvider: PermissionSnapshotProviding {
@@ -120,6 +127,10 @@ public struct SystemPermissionSnapshotProvider: PermissionSnapshotProviding {
             privateMultitouch: privateProbe.diagnostics()
         )
     }
+
+    public func isAccessibilityTrusted() -> Bool {
+        AXIsProcessTrusted()
+    }
 }
 
 public protocol PrivateCaptureDiagnosing {
@@ -130,7 +141,8 @@ public struct PrivateMultitouchRuntimeDiagnostics: PrivateCaptureDiagnosing {
     private static let frameworkPath = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
     private static let requiredSymbols = [
         "MTDeviceCreateList",
-        "MTRegisterContactFrameCallbackWithRefcon",
+        "MTRegisterContactFrameCallback",
+        "MTUnregisterContactFrameCallback",
         "MTDeviceStart",
         "MTDeviceStop",
         "MTDeviceIsBuiltIn",
@@ -162,20 +174,15 @@ public struct PrivateMultitouchRuntimeDiagnostics: PrivateCaptureDiagnosing {
             )
         }
 
-        typealias MTDeviceCreateList = @convention(c) () -> Unmanaged<CFArray>?
-        guard let createListSymbol = dlsym(handle, "MTDeviceCreateList") else {
-            return .unavailable
-        }
-
-        let createList = unsafeBitCast(createListSymbol, to: MTDeviceCreateList.self)
-        let devices = createList()?.takeUnretainedValue() as? [AnyObject] ?? []
-
+        // Device enumeration is exclusively owned by the capture worker. This
+        // probe reports capability only so permission refreshes can never race
+        // MTDeviceCreateList against capture start or hot-plug reconciliation.
         return PrivateCaptureDiagnostics(
             frameworkAvailable: true,
             requiredSymbolsAvailable: true,
-            deviceCount: devices.count,
+            deviceCount: 0,
             started: false,
-            reason: devices.isEmpty ? "No multitouch devices were reported." : "Private multitouch capture prerequisites are available."
+            reason: "Private multitouch capture capability is available; device state is pending capture."
         )
     }
 }

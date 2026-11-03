@@ -2,6 +2,7 @@ import Testing
 @testable import SwooshCore
 
 @Suite
+@MainActor
 struct LifecycleCoordinatorTests {
     @Test
     func shutdownAllCallsRegisteredResources() {

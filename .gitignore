@@ -13,4 +13,5 @@ docs/
 AGENTS.md
 Swoosh.zip
 Swoosh.app
+*.designated-requirement.txt
 typescript

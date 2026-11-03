@@ -9,46 +9,43 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let lifecycle = LifecycleCoordinator()
     private let store = UserDefaultsSettingsStore()
-    private let permissionProvider = SystemPermissionSnapshotProvider()
+    private let permissionState = PermissionStateService(
+        initialState: PermissionStateSnapshot(
+            diagnostics: SystemPermissionSnapshotProvider().snapshot()
+        )
+    )
     private let systemDiagnosticsProvider = SystemDiagnosticsProvider()
     private let loginItemCoordinator = LoginItemCoordinator(registrar: SystemLoginItemRegistrar())
     private let displayProvider = SystemDisplayProvider()
-    private let frameController = SystemWindowFrameController()
-    private let lifecycleController = WindowLifecycleController(client: SystemAccessibilityLifecycleClient())
-    private let frameHistory = WindowFrameHistory()
     private let runtimeSettings = KeyboardRuntimeSettings()
     private let modelBridge = SettingsModelBridge()
-    private lazy var targetResolver = WindowTargetResolver(
-        permissions: permissionProvider,
-        client: SystemAccessibilityTargetClient()
-    )
-    private lazy var commandDispatcher = KeyboardWindowCommandDispatcher(
-        targetResolver: targetResolver,
-        frameController: frameController,
-        lifecycleController: lifecycleController,
-        history: frameHistory,
-        displayProvider: { [displayProvider] in displayProvider.mainDisplay() },
-        displayListProvider: { [displayProvider] in displayProvider.displays() },
+    private lazy var windowAutomation = WindowAutomationService(
+        permissionState: permissionState,
+        displayProvider: { SystemDisplayProvider().mainDisplay() },
+        displayListProvider: { SystemDisplayProvider().displays() },
         gridSpacingProvider: { [runtimeSettings] in runtimeSettings.gridSpacing }
     )
     private lazy var shortcutRegistrar = SystemKeyboardShortcutRegistrar { [weak self] command in
         Task { @MainActor [weak self] in
-            self?.handleKeyboardCommand(command)
+            await self?.handleKeyboardCommand(command)
         }
     }
     private lazy var shortcutCoordinator = KeyboardShortcutCoordinator(registrar: shortcutRegistrar)
     private lazy var gestureInputCoordinator = GestureInputCoordinator(
-        settings: runtimeSettings.settings,
-        dispatcher: commandDispatcher
+        settings: runtimeSettings.settings
     )
     private lazy var gestureCapture = PrivateMultitouchCaptureSource(
         settingsProvider: { [runtimeSettings] in runtimeSettings.settings }
     )
     private lazy var gesturePreviewOverlay = GesturePreviewOverlayController()
+    private lazy var gestureTargetResolver = WindowAutomationGestureTargetResolver(
+        service: windowAutomation
+    )
     private lazy var gestureController = GestureRuntimeController(
         capture: gestureCapture,
-        targetResolver: targetResolver,
+        gestureTargetResolver: gestureTargetResolver,
         coordinator: gestureInputCoordinator,
+        diagnosticsSink: GestureDiagnosticsFactory.defaultSink(),
         topologyTokenProvider: { [displayProvider] in displayProvider.topologyToken },
         onCommandResult: { [modelBridge] result in
             modelBridge.recordGestureCommandResult(result)
@@ -78,24 +75,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var model: SettingsModel = {
         let model = SettingsModel(
             store: store,
-            permissionProvider: permissionProvider,
+            permissionState: permissionState,
             systemDiagnosticsProvider: systemDiagnosticsProvider,
             loginItemCoordinator: loginItemCoordinator,
             runtimeSettings: runtimeSettings,
             shortcutCoordinator: shortcutCoordinator,
-            commandDispatcher: commandDispatcher,
+            windowAutomation: windowAutomation,
             gestureController: gestureController
         )
         modelBridge.model = model
-        model.recheckPermissions()
         return model
     }()
     fileprivate var statusController: StatusMenuController?
     private var settingsWindowController: SettingsWindowController?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var captureDeviceObserver: CaptureDeviceChangeObserver?
+    private lazy var activationObserver = ApplicationActivationObserver { [weak self] in
+        self?.model.recheckPermissions()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Initialize the model first so a legacy-domain migration is completed
+        // before deciding whether this is a genuine first run.
+        let model = self.model
+        let isFirstRun = store.rawStoredData() == nil
         NSApplication.shared.setActivationPolicy(model.settings.showInDock ? .regular : .accessory)
         
         let menu = NSMenu()
@@ -108,14 +111,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         lifecycle.register(shortcutCoordinator)
         lifecycle.register(gestureController)
+        lifecycle.register(activationObserver)
+        activationObserver.start()
         installWorkspaceObservers()
         installCaptureDeviceObserver()
         statusController = StatusMenuController(model: model, lifecycle: lifecycle) { [weak self] in
             self?.openSettings()
         }
         settingsWindowController = SettingsWindowController(model: model)
-        DispatchQueue.main.async { [weak self] in
-            self?.openSettings()
+        model.start()
+
+        if isFirstRun || model.permissionDiagnostics.readiness != .ready {
+            DispatchQueue.main.async { [weak self] in
+                self?.openSettings()
+            }
         }
     }
 
@@ -147,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.model.recheckPermissions()
+                self?.model.recheckPermissions(forceRuntimeRefresh: true)
             }
         })
     }
@@ -172,11 +181,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openSettings() {
+        model.recheckPermissions()
         settingsWindowController?.show()
     }
 
-    private func handleKeyboardCommand(_ command: KeyboardCommand) {
-        model.handleKeyboardCommand(command)
+    fileprivate func updateActivationPolicy(showInDock: Bool) {
+        NSApplication.shared.setActivationPolicy(showInDock ? .regular : .accessory)
+        guard settingsWindowController?.isVisible == true else {
+            return
+        }
+
+        // Changing from a regular app to an accessory app can deactivate the
+        // process and send its visible window behind the current application.
+        // Reactivate after AppKit finishes the policy transition.
+        DispatchQueue.main.async { [weak self] in
+            self?.settingsWindowController?.show()
+        }
+    }
+
+    private func handleKeyboardCommand(_ command: KeyboardCommand) async {
+        await model.handleKeyboardCommand(command)
     }
 }
 
@@ -273,13 +297,28 @@ private final class CaptureDeviceChangeObserver {
     }
 }
 
-final class KeyboardRuntimeSettings {
-    var settings = SwooshSettings.defaults
-    var gridSpacing = SwooshSettings.defaults.gridSpacing
+final class KeyboardRuntimeSettings: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedSettings = SwooshSettings.defaults
+
+    var settings: SwooshSettings {
+        withLock { storedSettings }
+    }
+
+    var gridSpacing: Int {
+        withLock { storedSettings.gridSpacing }
+    }
 
     func apply(_ next: SwooshSettings) {
-        settings = next.normalized
-        gridSpacing = settings.gridSpacing
+        withLock {
+            storedSettings = next.normalized
+        }
+    }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
     }
 }
 
@@ -405,43 +444,57 @@ private final class SettingsModel: ObservableObject {
     @Published private(set) var gestureDebugSummary = "No gesture events yet"
 
     private let store: SettingsPersisting
-    private let permissionProvider: PermissionSnapshotProviding
+    private let permissionState: PermissionStateService
     private let systemDiagnosticsProvider: SystemDiagnosticsProviding
     private let loginItemCoordinator: LoginItemCoordinator
     private let runtimeSettings: KeyboardRuntimeSettings
     private let shortcutCoordinator: KeyboardShortcutCoordinator
-    private let commandDispatcher: KeyboardWindowCommandDispatcher
+    private let windowAutomation: WindowAutomationService
     private let gestureController: GestureRuntimeController
     private var shortcutRecordingDepth = 0
+    private var hasStarted = false
 
     init(
         store: SettingsPersisting,
-        permissionProvider: PermissionSnapshotProviding = SystemPermissionSnapshotProvider(),
+        permissionState: PermissionStateService,
         systemDiagnosticsProvider: SystemDiagnosticsProviding = SystemDiagnosticsProvider(),
         loginItemCoordinator: LoginItemCoordinator,
         runtimeSettings: KeyboardRuntimeSettings,
         shortcutCoordinator: KeyboardShortcutCoordinator,
-        commandDispatcher: KeyboardWindowCommandDispatcher,
+        windowAutomation: WindowAutomationService,
         gestureController: GestureRuntimeController
     ) {
         self.store = store
-        self.permissionProvider = permissionProvider
+        self.permissionState = permissionState
         self.systemDiagnosticsProvider = systemDiagnosticsProvider
         self.loginItemCoordinator = loginItemCoordinator
         self.runtimeSettings = runtimeSettings
         self.shortcutCoordinator = shortcutCoordinator
-        self.commandDispatcher = commandDispatcher
+        self.windowAutomation = windowAutomation
         self.gestureController = gestureController
         let loadedSettings = store.load().normalized
-        let loginSnapshot = loginItemCoordinator.refresh(settings: loadedSettings)
-        let effectiveSettings = loginSnapshot.settings
-        settings = effectiveSettings
-        runtimeSettings.apply(effectiveSettings)
-        permissionDiagnostics = permissionProvider.snapshot()
+        settings = loadedSettings
+        runtimeSettings.apply(loadedSettings)
+        permissionDiagnostics = permissionState.snapshot()
         systemDiagnostics = systemDiagnosticsProvider.snapshot()
+        loginItemState = LoginItemRegistrationState(status: .unavailable)
+    }
+
+    func start() {
+        guard !hasStarted else {
+            return
+        }
+        hasStarted = true
+
+        let loginSnapshot = loginItemCoordinator.refresh(settings: settings)
+        if loginSnapshot.settings != settings {
+            try? store.save(loginSnapshot.settings)
+        }
+        settings = loginSnapshot.settings
         loginItemState = loginSnapshot.state
-        shortcutRegistrationRecords = shortcutCoordinator.apply(effectiveSettings)
-        gestureController.apply(settings: effectiveSettings, permissions: permissionDiagnostics)
+        runtimeSettings.apply(settings)
+        shortcutRegistrationRecords = shortcutCoordinator.apply(settings)
+        gestureController.apply(settings: settings, permissions: permissionDiagnostics)
     }
 
     var isPaused: Bool {
@@ -471,25 +524,15 @@ private final class SettingsModel: ObservableObject {
     func update(_ mutate: (inout SwooshSettings) -> Void) {
         var next = settings
         mutate(&next)
+        next = next.normalized
         if next.launchAtLogin != settings.launchAtLogin {
             updateLaunchAtLogin(next.launchAtLogin)
             return
         }
 
-        if next.showInDock != settings.showInDock {
-            NSApplication.shared.setActivationPolicy(next.showInDock ? .regular : .accessory)
-        }
-        
-        if next.showInMenuBar != settings.showInMenuBar {
-            (NSApp.delegate as? AppDelegate)?.statusController?.updateVisibility(show: next.showInMenuBar)
-        }
-
         do {
             try store.save(next)
-            settings = next.normalized
-            runtimeSettings.apply(settings)
-            shortcutRegistrationRecords = shortcutCoordinator.apply(settings)
-            gestureController.apply(settings: settings, permissions: permissionDiagnostics)
+            applyPersistedSettings(next, previous: settings)
             lastError = nil
         } catch {
             lastError = String(describing: error)
@@ -498,48 +541,79 @@ private final class SettingsModel: ObservableObject {
 
     func restoreDefaults() {
         do {
+            let previous = settings
             let restored = try store.restoreDefaults()
             let loginSnapshot = loginItemCoordinator.setEnabled(restored.launchAtLogin, settings: restored)
             try store.save(loginSnapshot.settings)
-            settings = loginSnapshot.settings
             loginItemState = loginSnapshot.state
-            runtimeSettings.apply(settings)
-            shortcutRegistrationRecords = shortcutCoordinator.apply(settings)
-            gestureController.apply(settings: settings, permissions: permissionDiagnostics)
+            applyPersistedSettings(loginSnapshot.settings, previous: previous)
             lastError = nil
         } catch {
             lastError = String(describing: error)
         }
     }
 
-    func recheckPermissions() {
-        permissionDiagnostics = permissionProvider.snapshot()
+    func recheckPermissions(forceRuntimeRefresh: Bool = false) {
+        let previousPermissions = permissionDiagnostics
+        let nextPermissions = permissionState.refreshSystemPermissions().diagnostics
+        permissionDiagnostics = nextPermissions
         systemDiagnostics = systemDiagnosticsProvider.snapshot()
         refreshLoginItemState()
-        gestureController.apply(settings: settings, permissions: permissionDiagnostics)
+        if forceRuntimeRefresh || nextPermissions != previousPermissions {
+            gestureController.apply(settings: settings, permissions: nextPermissions)
+        }
     }
 
     func refreshLoginItemState() {
         let snapshot = loginItemCoordinator.refresh(settings: settings)
-        settings = snapshot.settings
         loginItemState = snapshot.state
-        runtimeSettings.apply(settings)
-        shortcutRegistrationRecords = shortcutCoordinator.apply(settings)
-        try? store.save(settings)
+        guard snapshot.settings != settings else {
+            return
+        }
+        let previous = settings
+        do {
+            try store.save(snapshot.settings)
+            applyPersistedSettings(snapshot.settings, previous: previous)
+        } catch {
+            lastError = String(describing: error)
+        }
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {
         do {
+            let previous = settings
             let snapshot = loginItemCoordinator.setEnabled(enabled, settings: settings)
             try store.save(snapshot.settings)
-            settings = snapshot.settings
             loginItemState = snapshot.state
-            runtimeSettings.apply(settings)
-            shortcutRegistrationRecords = shortcutCoordinator.apply(settings)
-            gestureController.apply(settings: settings, permissions: permissionDiagnostics)
+            applyPersistedSettings(snapshot.settings, previous: previous)
             lastError = snapshot.state.status == .error ? snapshot.state.message : nil
         } catch {
             lastError = String(describing: error)
+        }
+    }
+
+    private func applyPersistedSettings(_ next: SwooshSettings, previous: SwooshSettings) {
+        let normalized = next.normalized
+        settings = normalized
+        runtimeSettings.apply(normalized)
+
+        if normalized.showInDock != previous.showInDock {
+            (NSApp.delegate as? AppDelegate)?.updateActivationPolicy(showInDock: normalized.showInDock)
+        }
+        if normalized.showInMenuBar != previous.showInMenuBar {
+            (NSApp.delegate as? AppDelegate)?.statusController?.updateVisibility(show: normalized.showInMenuBar)
+        }
+        if normalized.keyboardBindings != previous.keyboardBindings || normalized.isPaused != previous.isPaused {
+            shortcutRegistrationRecords = shortcutCoordinator.apply(normalized)
+        }
+
+        let requiresCaptureReconfiguration = normalized.gesturesEnabled != previous.gesturesEnabled ||
+            normalized.isPaused != previous.isPaused ||
+            normalized.sensitivity != previous.sensitivity
+        if requiresCaptureReconfiguration {
+            gestureController.apply(settings: normalized, permissions: permissionDiagnostics)
+        } else {
+            gestureController.updateSettings(normalized)
         }
     }
 
@@ -567,12 +641,12 @@ private final class SettingsModel: ObservableObject {
         shortcutRegistrationRecords = shortcutCoordinator.apply(settings)
     }
 
-    func handleKeyboardCommand(_ command: KeyboardCommand) {
+    func handleKeyboardCommand(_ command: KeyboardCommand) async {
         guard !settings.isPaused, !isRecordingShortcut else {
             return
         }
 
-        lastCommandResult = commandDispatcher.dispatch(command)
+        lastCommandResult = await windowAutomation.dispatch(command)
     }
 
     func recordGestureCommandResult(_ result: WindowCommandResult) {
@@ -580,7 +654,7 @@ private final class SettingsModel: ObservableObject {
     }
 
     func recordPrivateCaptureDiagnostics(_ diagnostics: PrivateCaptureDiagnostics) {
-        permissionDiagnostics.privateMultitouch = diagnostics
+        permissionDiagnostics = permissionState.updatePrivateMultitouch(diagnostics).diagnostics
     }
 
     func recordGestureStatus(_ status: GestureInputStatus, failureReason: GestureInputFailureReason?) {
@@ -594,760 +668,6 @@ private final class SettingsModel: ObservableObject {
 }
 
 @MainActor
-final class GestureRuntimeController: @preconcurrency LifecycleResource {
-    private let capture: GestureCaptureSource
-    private let targetResolver: WindowTargetResolver
-    private let coordinator: GestureInputCoordinator
-    private let topologyTokenProvider: () -> String
-    private let onCommandResult: (WindowCommandResult) -> Void
-    private let onCaptureDiagnostics: (PrivateCaptureDiagnostics) -> Void
-    private let onStatusChanged: (GestureInputStatus, GestureInputFailureReason?) -> Void
-    private let onDebugChanged: (String) -> Void
-    private let onPreviewChanged: (KeyboardCommand, Bool?, DisplayMovementPreviewContext?, ScreenPoint) -> Void
-    private let onPreviewEnded: () -> Void
-    private var settings = SwooshSettings.defaults
-    private var timeoutGeneration = 0
-    private var resolverSessionActive = false
-    private var capturedEventCount = 0
-    private var titlebarRejectCount = 0
-    private var commandCommitCount = 0
-    private var lastDebugEvent = "No gesture events yet"
-    private var pendingRestoreTap: RestoreTapCandidate?
-    private var activeGestureTarget: WindowTargetIdentity?
-    private var activeGestureModifierMode: GestureModifierMode = .unsupported
-    private var activeGestureStartedAt: Int?
-    private var stagedStrokeDirections: [GestureDirection] = []
-    private var lastPresentedPreviewLabel: String?
-    private var idleDiscardGeneration = 0
-    private var suppressActiveGestureUntilRelease = false
-    private let previewLatencyTracker = GesturePreviewLatencyTracker()
-    private let captureOwnership = CaptureEventOwnershipGate()
-    private let restoreDoubleTapWindowMilliseconds = 450
-    private var expectedCaptureDeviceCount = 0
-    private var captureRefreshGeneration = 0
-    private var captureRefreshScheduled = false
-    private var captureRecoveryAttempt = 0
-    private var lastCaptureDeviceCount = 0
-    private var lastStartedCaptureDeviceCount = 0
-    private let captureDeviceChangeDebounceMilliseconds = 350
-    private let captureRecoveryRetryMilliseconds = 1_000
-    private let maximumCaptureRecoveryAttempts = 12
-
-    init(
-        capture: GestureCaptureSource,
-        targetResolver: WindowTargetResolver,
-        coordinator: GestureInputCoordinator,
-        topologyTokenProvider: @escaping () -> String,
-        onCommandResult: @escaping (WindowCommandResult) -> Void,
-        onCaptureDiagnostics: @escaping (PrivateCaptureDiagnostics) -> Void,
-        onStatusChanged: @escaping (GestureInputStatus, GestureInputFailureReason?) -> Void,
-        onDebugChanged: @escaping (String) -> Void,
-        onPreviewChanged: @escaping (KeyboardCommand, Bool?, DisplayMovementPreviewContext?, ScreenPoint) -> Void,
-        onPreviewEnded: @escaping () -> Void
-    ) {
-        self.capture = capture
-        self.targetResolver = targetResolver
-        self.coordinator = coordinator
-        self.topologyTokenProvider = topologyTokenProvider
-        self.onCommandResult = onCommandResult
-        self.onCaptureDiagnostics = onCaptureDiagnostics
-        self.onStatusChanged = onStatusChanged
-        self.onDebugChanged = onDebugChanged
-        self.onPreviewChanged = onPreviewChanged
-        self.onPreviewEnded = onPreviewEnded
-    }
-
-    func apply(settings: SwooshSettings, permissions: PermissionDiagnostics) {
-        self.settings = settings.normalized
-        coordinator.updateSettings(self.settings)
-        timeoutGeneration += 1
-        idleDiscardGeneration += 1
-        captureRefreshGeneration += 1
-        captureRefreshScheduled = false
-        captureRecoveryAttempt = 0
-        previewLatencyTracker.reset()
-        captureOwnership.reset()
-        resetActiveGestureState()
-        onPreviewEnded()
-
-        let permissionReady = permissions.accessibilityTrusted && permissions.inputMonitoringTrusted
-        let captureReady = permissions.privateMultitouch.isUsable
-        expectedCaptureDeviceCount = max(expectedCaptureDeviceCount, permissions.privateMultitouch.deviceCount)
-        coordinator.start(permissionReady: permissionReady, captureReady: captureReady)
-        updateDebug("startup permissions=\(permissionReady ? "ready" : "missing") capturePrereq=\(captureReady ? "available" : "unavailable")")
-        publishStatus()
-
-        guard self.settings.gesturesEnabled, !self.settings.isPaused, permissionReady, captureReady else {
-            capture.stop()
-            captureRefreshGeneration += 1
-            captureRefreshScheduled = false
-            captureRecoveryAttempt = 0
-            updateDebug("capture stopped: gestures=\(self.settings.gesturesEnabled) paused=\(self.settings.isPaused) permissions=\(permissionReady) prereq=\(captureReady)")
-            return
-        }
-
-        switch capture.start(handler: { [weak self] event in
-            Task { @MainActor [weak self] in
-                self?.handle(event)
-            }
-        }) {
-        case .running(let diagnostics):
-            handleCaptureRunning(diagnostics, context: "capture running")
-        case .failed(let diagnostics):
-            onCaptureDiagnostics(diagnostics)
-            coordinator.listenerFailed()
-            updateDebug("capture failed: \(diagnostics.reason)")
-            publishStatus()
-        case .stopped:
-            updateDebug("capture stopped")
-            publishStatus()
-        }
-    }
-
-    func captureDevicesDidChange() {
-        captureRecoveryAttempt = 0
-        scheduleCaptureDeviceRefresh(reason: "device change")
-    }
-
-    func shutdown() {
-        timeoutGeneration += 1
-        idleDiscardGeneration += 1
-        captureRefreshGeneration += 1
-        captureRefreshScheduled = false
-        captureRecoveryAttempt = 0
-        previewLatencyTracker.reset()
-        captureOwnership.reset()
-        resetActiveGestureState()
-        onPreviewEnded()
-        _ = coordinator.cancel(.paused, at: timestampMilliseconds())
-        coordinator.stop()
-        capture.stop()
-        updateDebug("shutdown")
-        publishStatus()
-    }
-
-    func suspendForSystemSleep() {
-        timeoutGeneration += 1
-        idleDiscardGeneration += 1
-        captureRefreshGeneration += 1
-        captureRefreshScheduled = false
-        captureRecoveryAttempt = 0
-        previewLatencyTracker.reset()
-        captureOwnership.reset()
-        resetActiveGestureState()
-        onPreviewEnded()
-        _ = coordinator.cancel(.gestureCancelled, at: timestampMilliseconds())
-        capture.stop()
-        updateDebug("capture stopped: system sleep")
-        publishStatus()
-    }
-
-    private func handleCaptureRunning(
-        _ diagnostics: PrivateCaptureDiagnostics,
-        context: String,
-        forceDebug: Bool = true
-    ) {
-        expectedCaptureDeviceCount = max(
-            expectedCaptureDeviceCount,
-            diagnostics.deviceCount,
-            diagnostics.startedDeviceCount
-        )
-        let deviceCountsChanged = diagnostics.deviceCount != lastCaptureDeviceCount ||
-            diagnostics.startedDeviceCount != lastStartedCaptureDeviceCount
-        lastCaptureDeviceCount = diagnostics.deviceCount
-        lastStartedCaptureDeviceCount = diagnostics.startedDeviceCount
-        let startedSummary = diagnostics.startedDeviceCount > 0
-            ? "\(diagnostics.startedDeviceCount)/\(max(diagnostics.deviceCount, diagnostics.startedDeviceCount))"
-            : "\(diagnostics.started)"
-        onCaptureDiagnostics(diagnostics)
-        if forceDebug || deviceCountsChanged || diagnostics.startedDeviceCount < expectedCaptureDeviceCount {
-            updateDebug("\(context): devices=\(diagnostics.deviceCount) started=\(startedSummary)")
-            publishStatus()
-        }
-        if diagnostics.startedDeviceCount >= expectedCaptureDeviceCount {
-            captureRecoveryAttempt = 0
-        } else if context.hasPrefix("capture refresh") {
-            scheduleCaptureRecoveryIfNeeded()
-        }
-    }
-
-    private func scheduleCaptureRecoveryIfNeeded() {
-        guard lastStartedCaptureDeviceCount < expectedCaptureDeviceCount else {
-            captureRecoveryAttempt = 0
-            return
-        }
-
-        guard captureRecoveryAttempt < maximumCaptureRecoveryAttempts else {
-            updateDebug("capture recovery waiting for device change: devices=\(lastCaptureDeviceCount) expected=\(expectedCaptureDeviceCount)")
-            publishStatus()
-            return
-        }
-
-        captureRecoveryAttempt += 1
-        scheduleCaptureDeviceRefresh(
-            reason: "device recovery \(captureRecoveryAttempt)/\(maximumCaptureRecoveryAttempts)",
-            delayMilliseconds: captureRecoveryRetryMilliseconds
-        )
-    }
-
-    private func scheduleCaptureDeviceRefresh(
-        reason: String,
-        delayMilliseconds: Int? = nil
-    ) {
-        guard settings.gesturesEnabled,
-              !settings.isPaused,
-              !captureRefreshScheduled
-        else {
-            return
-        }
-
-        captureRefreshScheduled = true
-        let generation = captureRefreshGeneration
-        let delay = delayMilliseconds ?? captureDeviceChangeDebounceMilliseconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
-            guard let self,
-                  self.captureRefreshGeneration == generation,
-                  self.settings.gesturesEnabled,
-                  !self.settings.isPaused
-            else {
-                return
-            }
-
-            self.captureRefreshScheduled = false
-            switch self.capture.refreshDevices() {
-            case .running(let refreshed):
-                self.handleCaptureRunning(refreshed, context: "capture refresh: \(reason)", forceDebug: false)
-            case .failed(let refreshed):
-                self.onCaptureDiagnostics(refreshed)
-                self.coordinator.listenerFailed()
-                self.updateDebug("capture refresh failed after \(reason): \(refreshed.reason)")
-                self.publishStatus()
-            case .stopped:
-                self.updateDebug("capture refresh after \(reason): stopped")
-                self.publishStatus()
-            }
-        }
-    }
-
-    private func handle(_ event: CapturedGestureEvent) {
-        capturedEventCount += 1
-        if event.source.isSpecified, event.source.generation != capture.currentGeneration {
-            updateDebug("ignored stale capture event from \(event.source.deviceID)")
-            publishStatus()
-            return
-        }
-        guard captureOwnership.shouldAccept(event) else {
-            updateDebug("ignored competing capture event from \(event.source.deviceID)")
-            publishStatus()
-            return
-        }
-
-        switch event {
-        case .began(let start):
-            timeoutGeneration += 1
-            idleDiscardGeneration += 1
-            suppressActiveGestureUntilRelease = false
-            guard !resolverSessionActive else {
-                updateDebug("begin ignored during active chain")
-                return
-            }
-            let targetResult = targetResolver.targetUnderPointer(at: start.pointer)
-            let target = try? targetResult.get().identity
-            if target == nil {
-                titlebarRejectCount += 1
-                updateDebug("begin rejected: \(targetResult.failureDescription)")
-            }
-            let result = route(.begin(GestureSessionStart(
-                target: target,
-                modifiers: start.modifiers,
-                timestampMilliseconds: start.timestampMilliseconds,
-                topologyToken: topologyTokenProvider()
-            )), actionID: nil)
-            resolverSessionActive = result.resolverOutput.kind == .none
-            if resolverSessionActive {
-                activeGestureTarget = target
-                activeGestureModifierMode = modifierMode(for: start.modifiers, settings: settings)
-                activeGestureStartedAt = start.timestampMilliseconds
-                lastPresentedPreviewLabel = nil
-                scheduleIdleDiscard(at: start.timestampMilliseconds)
-                updateDebug("begin accepted: modifiers=\(start.modifiers.debugNames)")
-            }
-
-        case .movement(let timestampMilliseconds):
-            handleMovement(at: timestampMilliseconds)
-
-        case .deviceMovement(let movement):
-            handleMovement(at: movement.timestampMilliseconds)
-
-        case .changed(let progress):
-            guard !suppressActiveGestureUntilRelease else {
-                return
-            }
-            guard !cancelForTopologyChangeIfNeeded(at: progress.timestampMilliseconds) else {
-                return
-            }
-            presentLivePreview(for: progress)
-
-        case .strokeEnded(let stroke):
-            handleStrokeEnded(stroke, sourceEvent: event)
-
-        case .pinchEnded(let pinch):
-            handlePinchEnded(pinch, sourceEvent: event)
-
-        case .tapEnded(let tap):
-            idleDiscardGeneration += 1
-            if suppressActiveGestureUntilRelease {
-                suppressActiveGestureUntilRelease = false
-                updateDebug("tap ignored after idle discard")
-                captureOwnership.releaseOwner(for: event)
-                publishStatus()
-                return
-            }
-            handleRestoreTap(tap)
-            captureOwnership.releaseOwner(for: event)
-
-        case .ended(let timestampMilliseconds):
-            handleEnded(at: timestampMilliseconds, sourceEvent: event)
-
-        case .deviceEnded(let end):
-            handleEnded(at: end.timestampMilliseconds, sourceEvent: event)
-
-        case .cancelled(let reason, let timestampMilliseconds):
-            handleCancelled(reason, at: timestampMilliseconds, sourceEvent: event)
-
-        case .deviceCancelled(let cancellation):
-            handleCancelled(cancellation.reason, at: cancellation.timestampMilliseconds, sourceEvent: event)
-        }
-
-        publishStatus()
-    }
-
-    private func handleMovement(at timestampMilliseconds: Int) {
-        guard !suppressActiveGestureUntilRelease else {
-            return
-        }
-        guard !cancelForTopologyChangeIfNeeded(at: timestampMilliseconds) else {
-            return
-        }
-        scheduleIdleDiscard(at: timestampMilliseconds)
-    }
-
-    private func handleStrokeEnded(_ stroke: CapturedGestureStroke, sourceEvent event: CapturedGestureEvent) {
-        guard !suppressActiveGestureUntilRelease else {
-            suppressActiveGestureUntilRelease = false
-            updateDebug("stroke \(stroke.direction.rawValue): ignored after idle discard")
-            captureOwnership.releaseOwner(for: event)
-            publishStatus()
-            return
-        }
-        pendingRestoreTap = nil
-        guard !cancelForTopologyChangeIfNeeded(at: stroke.timestampMilliseconds) else {
-            return
-        }
-        if !resolverSessionActive {
-            beginResolverSession(
-                pointer: stroke.pointer,
-                modifiers: stroke.modifiers,
-                timestampMilliseconds: stroke.timestampMilliseconds,
-                debugPrefix: "late stroke begin"
-            )
-        }
-        let result = route(.strokeEnded(GestureStroke(
-            direction: stroke.direction,
-            timestampMilliseconds: stroke.timestampMilliseconds,
-            eventID: stroke.eventID,
-            modifiers: stroke.modifiers
-        )), actionID: stroke.eventID)
-        switch result.resolverOutput.kind {
-        case .preview:
-            resolverSessionActive = true
-            stagedStrokeDirections.append(stroke.direction)
-            lastPresentedPreviewLabel = nil
-            updateDebug("stroke \(stroke.direction.rawValue): preview \(result.resolverOutput.intent?.command.displayName ?? "unknown")")
-        case .commit, .cancel, .passThrough:
-            onPreviewEnded()
-            captureOwnership.releaseOwner(for: event)
-            resetActiveGestureState()
-            updateDebug("stroke \(stroke.direction.rawValue): \(result.resolverOutput.kind.rawValue)\(result.commandResult.debugSuffix)")
-        case .none:
-            updateDebug("stroke \(stroke.direction.rawValue): ignored")
-            break
-        }
-    }
-
-    private func handlePinchEnded(_ pinch: CapturedGesturePinch, sourceEvent event: CapturedGestureEvent) {
-        timeoutGeneration += 1
-        idleDiscardGeneration += 1
-        if suppressActiveGestureUntilRelease {
-            suppressActiveGestureUntilRelease = false
-            updateDebug("pinch \(pinch.direction.rawValue): ignored after idle discard")
-            captureOwnership.releaseOwner(for: event)
-            publishStatus()
-            return
-        }
-        pendingRestoreTap = nil
-        guard !cancelForTopologyChangeIfNeeded(at: pinch.timestampMilliseconds) else {
-            return
-        }
-        if !resolverSessionActive {
-            beginResolverSession(
-                pointer: pinch.pointer,
-                modifiers: pinch.modifiers,
-                timestampMilliseconds: pinch.timestampMilliseconds,
-                debugPrefix: "late pinch begin",
-                fallingBackToFrontmost: pinch.direction == .outward
-            )
-        }
-        let result = route(.pinchEnded(GesturePinch(
-            direction: pinch.direction,
-            timestampMilliseconds: pinch.timestampMilliseconds,
-            eventID: pinch.eventID,
-            isCancelled: pinch.isCancelled,
-            modifiers: pinch.modifiers
-        )), actionID: pinch.eventID)
-        captureOwnership.releaseOwner(for: event)
-        if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
-            onPreviewEnded()
-            resetActiveGestureState()
-        }
-        updateDebug("pinch \(pinch.direction.rawValue): \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")\(result.commandResult.debugSuffix)")
-    }
-
-    private func handleEnded(at timestampMilliseconds: Int, sourceEvent event: CapturedGestureEvent) {
-        idleDiscardGeneration += 1
-        if suppressActiveGestureUntilRelease {
-            suppressActiveGestureUntilRelease = false
-            updateDebug("ended ignored after idle discard")
-            captureOwnership.releaseOwner(for: event)
-            publishStatus()
-            return
-        }
-        guard !cancelForTopologyChangeIfNeeded(at: timestampMilliseconds) else {
-            return
-        }
-        let result = route(.release(timestampMilliseconds: timestampMilliseconds), actionID: "release-\(timestampMilliseconds)")
-        captureOwnership.releaseOwner(for: event)
-        if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
-            onPreviewEnded()
-            resetActiveGestureState()
-        }
-        updateDebug("release: \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")\(result.commandResult.debugSuffix)")
-    }
-
-    private func handleCancelled(_ reason: GestureCancelReason, at timestampMilliseconds: Int, sourceEvent event: CapturedGestureEvent) {
-        timeoutGeneration += 1
-        idleDiscardGeneration += 1
-        captureOwnership.releaseOwner(for: event)
-        resetActiveGestureState()
-        onPreviewEnded()
-        _ = coordinator.cancel(reason, at: timestampMilliseconds)
-        updateDebug("cancelled: \(reason.rawValue)")
-    }
-
-    private func beginResolverSession(
-        pointer: ScreenPoint,
-        modifiers: Set<ModifierRole>,
-        timestampMilliseconds: Int,
-        debugPrefix: String,
-        fallingBackToFrontmost: Bool = false
-    ) {
-        let targetResult = targetResolver.targetUnderPointer(
-            at: pointer,
-            fallingBackToFrontmost: fallingBackToFrontmost
-        )
-        let target = try? targetResult.get().identity
-        if target == nil {
-            titlebarRejectCount += 1
-            updateDebug("\(debugPrefix) rejected: \(targetResult.failureDescription)")
-        }
-        let result = route(.begin(GestureSessionStart(
-            target: target,
-            modifiers: modifiers,
-            timestampMilliseconds: timestampMilliseconds,
-            topologyToken: topologyTokenProvider()
-        )), actionID: nil)
-        resolverSessionActive = result.resolverOutput.kind == .none
-        if resolverSessionActive {
-            activeGestureTarget = target
-            activeGestureModifierMode = modifierMode(for: modifiers, settings: settings)
-            activeGestureStartedAt = timestampMilliseconds
-            lastPresentedPreviewLabel = nil
-            scheduleIdleDiscard(at: timestampMilliseconds)
-            updateDebug("\(debugPrefix) accepted: modifiers=\(modifiers.debugNames)")
-        }
-    }
-
-    @discardableResult
-    private func route(_ event: GestureResolverEvent, actionID: String?) -> GestureInputResult {
-        let result = coordinator.handle(event, actionID: actionID)
-        if let commandResult = result.commandResult {
-            commandCommitCount += 1
-            onCommandResult(commandResult)
-            updateDebug(commandResult.debugSummary)
-        }
-        return result
-    }
-
-    private func cancelForTopologyChangeIfNeeded(at timestampMilliseconds: Int) -> Bool {
-        let result = coordinator.cancelIfTopologyChanged(
-            currentTopologyToken: topologyTokenProvider(),
-            at: timestampMilliseconds
-        )
-        guard result.resolverOutput.kind == .cancel else {
-            return false
-        }
-
-        onPreviewEnded()
-        captureOwnership.releaseOwner()
-        resetActiveGestureState()
-        updateDebug("topology changed: cancelled preview")
-        publishStatus()
-        return true
-    }
-
-    private func handleRestoreTap(_ tap: CapturedGestureTap) {
-        timeoutGeneration += 1
-        if resolverSessionActive {
-            _ = coordinator.cancel(.gestureCancelled, at: tap.timestampMilliseconds)
-            resetActiveGestureState(clearPendingTap: false)
-        }
-
-        let targetResult = targetResolver.targetUnderPointer(at: tap.pointer)
-        guard let target = try? targetResult.get().identity else {
-            titlebarRejectCount += 1
-            resetActiveGestureState()
-            updateDebug("tap rejected: \(targetResult.failureDescription)")
-            return
-        }
-
-        guard let previous = pendingRestoreTap,
-              previous.target == target,
-              previous.source == tap.source,
-              previous.modifiers == tap.modifiers,
-              tap.timestampMilliseconds - previous.timestampMilliseconds <= restoreDoubleTapWindowMilliseconds
-        else {
-            pendingRestoreTap = RestoreTapCandidate(
-                source: tap.source,
-                target: target,
-                modifiers: tap.modifiers,
-                timestampMilliseconds: tap.timestampMilliseconds
-            )
-            updateDebug("tap waiting second: modifiers=\(tap.modifiers.debugNames)")
-            return
-        }
-
-        pendingRestoreTap = nil
-        let command = settings.centerBehavior.keyboardCommand
-        let result = coordinator.dispatch(command, to: target, actionID: tap.eventID)
-        onPreviewEnded()
-        if let commandResult = result.commandResult {
-            commandCommitCount += 1
-            onCommandResult(commandResult)
-            updateDebug(commandResult.debugSummary)
-        }
-        updateDebug("double tap restore: \(result.resolverOutput.kind.rawValue) \(command.displayName)")
-    }
-
-    private func presentLivePreview(for progress: CapturedGestureProgress) {
-        guard settings.previewsEnabled,
-              settings.overlayPreviewSize != .off,
-              resolverSessionActive,
-              activeGestureTarget != nil,
-              let command = previewCommand(for: progress)
-        else {
-            return
-        }
-
-        let label = command.displayName
-        guard label != lastPresentedPreviewLabel else {
-            onPreviewChanged(command, fullscreenState(for: command), displayMovementPreview(for: command), progress.pointer)
-            recordPreviewLatency(recognizedAt: progress.timestampMilliseconds)
-            updateDebug("live preview: \(label)")
-            return
-        }
-
-        lastPresentedPreviewLabel = label
-        onPreviewChanged(command, fullscreenState(for: command), displayMovementPreview(for: command), progress.pointer)
-        recordPreviewLatency(recognizedAt: progress.timestampMilliseconds)
-        updateDebug("live preview: \(label)")
-    }
-
-    private func fullscreenState(for command: KeyboardCommand) -> Bool? {
-        guard command == .toggleFullscreen, let activeGestureTarget else {
-            return nil
-        }
-
-        return coordinator.isFullscreen(activeGestureTarget)
-    }
-
-    private func displayMovementPreview(for command: KeyboardCommand) -> DisplayMovementPreviewContext? {
-        guard command.displayMoveDirection != nil, let activeGestureTarget else {
-            return nil
-        }
-
-        return coordinator.displayMovementPreview(for: command, target: activeGestureTarget)
-    }
-
-    private func recordPreviewLatency(recognizedAt timestamp: Int) {
-        _ = previewLatencyTracker.record(
-            recognizedAt: timestamp,
-            presentedAt: timestampMilliseconds()
-        )
-    }
-
-    private func previewCommand(for progress: CapturedGestureProgress) -> KeyboardCommand? {
-        switch progress.kind {
-        case .stroke(let direction):
-            switch activeGestureModifierMode {
-            case .unmodified:
-                return GestureSequenceResolver.command(
-                    for: stagedStrokeDirections + [direction],
-                    modifierMode: activeGestureModifierMode,
-                    startedAt: activeGestureStartedAt,
-                    timestampMilliseconds: progress.timestampMilliseconds,
-                    configuration: GestureResolverConfiguration(settings: settings)
-                )
-            case .general:
-                return GestureSequenceResolver.command(
-                    for: [direction],
-                    modifierMode: activeGestureModifierMode,
-                    startedAt: activeGestureStartedAt,
-                    timestampMilliseconds: progress.timestampMilliseconds,
-                    configuration: GestureResolverConfiguration(settings: settings)
-                )
-            case .screen:
-                return GestureSequenceResolver.command(
-                    for: [direction],
-                    modifierMode: activeGestureModifierMode,
-                    startedAt: activeGestureStartedAt,
-                    timestampMilliseconds: progress.timestampMilliseconds,
-                    configuration: GestureResolverConfiguration(settings: settings)
-                )
-            case .unsupported:
-                return nil
-            }
-        case .pinch(let direction):
-            guard activeGestureModifierMode == .unmodified else {
-                return nil
-            }
-            return direction == .inward ? .close : .toggleFullscreen
-        }
-    }
-
-    private func scheduleTimeout(after stroke: CapturedGestureStroke) {
-        timeoutGeneration += 1
-        let generation = timeoutGeneration
-        let delay = settings.chainTimeoutMilliseconds
-        let timeoutTimestamp = stroke.timestampMilliseconds + delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
-            guard let self, self.timeoutGeneration == generation else {
-                return
-            }
-            guard !self.cancelForTopologyChangeIfNeeded(at: timeoutTimestamp) else {
-                return
-            }
-            let result = self.route(.timeout(timestampMilliseconds: timeoutTimestamp), actionID: "timeout-\(stroke.eventID)")
-            if result.resolverOutput.kind == .commit || result.resolverOutput.kind == .cancel || result.resolverOutput.kind == .passThrough {
-                self.captureOwnership.releaseOwner()
-                self.resetActiveGestureState()
-            }
-            self.updateDebug("timeout: \(result.resolverOutput.kind.rawValue) \(result.resolverOutput.intent?.command.displayName ?? "")")
-            self.publishStatus()
-        }
-    }
-
-    private func scheduleIdleDiscard(at timestampMilliseconds: Int) {
-        idleDiscardGeneration += 1
-        let generation = idleDiscardGeneration
-        let delay = settings.gestureIdleTimeoutMilliseconds
-        let cancelTimestamp = timestampMilliseconds + delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
-            guard let self,
-                  self.idleDiscardGeneration == generation,
-                  self.resolverSessionActive
-            else {
-                return
-            }
-
-            _ = self.coordinator.cancel(.gestureCancelled, at: cancelTimestamp)
-            self.suppressActiveGestureUntilRelease = true
-            self.resetActiveGestureState(clearSuppression: false)
-            self.onPreviewEnded()
-            self.updateDebug("idle discard after \(delay)ms")
-            self.publishStatus()
-        }
-    }
-
-    private func publishStatus() {
-        onStatusChanged(coordinator.currentStatus, coordinator.currentFailureReason)
-    }
-
-    private func updateDebug(_ event: String) {
-        lastDebugEvent = event
-        let latency = previewLatencyTracker.summary
-        let previewSummary = latency.p95Milliseconds.map { "previewP95=\($0)ms/\(latency.count)" } ?? "previewP95=none/0"
-        let summary = "events=\(capturedEventCount), titlebarRejects=\(titlebarRejectCount), commands=\(commandCommitCount), \(previewSummary), last=\(lastDebugEvent)"
-        onDebugChanged(summary)
-        if let data = "[swoosh] \(summary)\n".data(using: .utf8) {
-            FileHandle.standardError.write(data)
-        }
-    }
-
-    private func timestampMilliseconds() -> Int {
-        Int((Date().timeIntervalSince1970 * 1_000).rounded())
-    }
-
-    private func resetActiveGestureState(clearPendingTap: Bool = true, clearSuppression: Bool = true) {
-        resolverSessionActive = false
-        if clearPendingTap {
-            pendingRestoreTap = nil
-        }
-        if clearSuppression {
-            suppressActiveGestureUntilRelease = false
-        }
-        activeGestureTarget = nil
-        activeGestureModifierMode = .unsupported
-        activeGestureStartedAt = nil
-        stagedStrokeDirections = []
-        lastPresentedPreviewLabel = nil
-    }
-}
-
-private struct RestoreTapCandidate {
-    var source: CapturedGestureSource
-    var target: WindowTargetIdentity
-    var modifiers: Set<ModifierRole>
-    var timestampMilliseconds: Int
-}
-
-private extension CenterBehavior {
-    var keyboardCommand: KeyboardCommand {
-        switch self {
-        case .centerAndUnsnap:
-            .centerAndUnsnap
-        case .center:
-            .center
-        case .unsnap:
-            .unsnap
-        }
-    }
-}
-
-private func modifierMode(for modifiers: Set<ModifierRole>, settings: SwooshSettings) -> GestureModifierMode {
-    if modifiers.isEmpty {
-        return .unmodified
-    }
-
-    if modifiers == [settings.generalModifier] {
-        return .general
-    }
-
-    if modifiers == [settings.screenModifier] {
-        return .screen
-    }
-
-    return .unsupported
-}
 
 private extension OverlayPreviewSize {
     var panelSize: NSSize {
@@ -1512,9 +832,12 @@ private final class SettingsWindowController {
     }
 
     func show() {
-        window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
+
+    var isVisible: Bool { window.isVisible }
 }
 
 @MainActor
@@ -1536,10 +859,10 @@ final class GesturePreviewOverlayController {
         )
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.ignoresMouseEvents = true
         panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
         panel.contentView = previewView
     }
 
@@ -1566,7 +889,7 @@ final class GesturePreviewOverlayController {
         panel.orderFrontRegardless()
 
         let workItem = DispatchWorkItem { [weak self] in
-            self?.panel.orderOut(nil)
+            self?.hide()
         }
         hideWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2), execute: workItem)
@@ -1575,6 +898,7 @@ final class GesturePreviewOverlayController {
     func hide() {
         hideWorkItem?.cancel()
         hideWorkItem = nil
+        panel.alphaValue = 0
         previewView.displayMovementPreview = nil
         panel.orderOut(nil)
     }
@@ -1717,7 +1041,7 @@ private final class GesturePreviewOverlayView: NSView {
             let width = capsule.width * 0.58
             let height = capsule.height * 0.58
             rect = NSRect(x: capsule.midX - width / 2, y: capsule.midY - height / 2, width: width, height: height)
-        case .close:
+        case .close, .quit:
             rect = capsule.insetBy(dx: capsule.width * 0.18, dy: capsule.height * 0.18)
         case .maximize,
              .toggleFullscreen,
@@ -1822,6 +1146,8 @@ private final class GesturePreviewOverlayView: NSView {
         switch command {
         case .close:
             return .close
+        case .quit:
+            return .quit
         case .minimize:
             return .minimize
         case .toggleFullscreen:
@@ -1847,7 +1173,7 @@ private final class GesturePreviewOverlayView: NSView {
         NSColor.white.withAlphaComponent(0.98).setStroke()
         NSColor.white.withAlphaComponent(0.98).setFill()
         switch button {
-        case .close:
+        case .close, .quit:
             drawCloseGlyph(in: rect)
         case .minimize:
             drawMinimizeGlyph(in: rect)
@@ -1922,6 +1248,7 @@ private final class GesturePreviewOverlayView: NSView {
 
 private enum LifecyclePreviewButton {
     case close
+    case quit
     case minimize
     case enterFullscreen
     case exitFullscreen
@@ -1929,6 +1256,8 @@ private enum LifecyclePreviewButton {
     var fillColor: NSColor {
         switch self {
         case .close:
+            return NSColor(calibratedRed: 1.0, green: 0.62, blue: 0.34, alpha: 1.0)
+        case .quit:
             return .systemRed
         case .minimize:
             return .systemBlue

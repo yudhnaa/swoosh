@@ -39,8 +39,9 @@ struct WindowGeometryTests {
         let clampedToSettingRange = engine.frame(for: .maximize, on: display, gridSpacing: 32)
 
         #expect(rightHalf.isWithin(0.001, of: GeometryRect(x: 762, y: 50, width: 738, height: 920)))
-        #expect(maximized.isWithin(0.001, of: GeometryRect(x: 12, y: 50, width: 1488, height: 920)))
+        #expect(maximized == display.usableFrame)
         #expect(clampedFromOversizedSetting == clampedToSettingRange)
+        #expect(clampedToSettingRange == display.usableFrame)
     }
 
     @Test
@@ -91,36 +92,64 @@ struct WindowGeometryTests {
     }
 
     @Test
-    func desktopCoordinateConversionUsesSharedTopAcrossOffsetDisplays() {
+    func desktopCoordinateConversionUsesPrimaryDisplayTopAcrossOffsetDisplays() {
         let converter = CoordinateConverter()
         let primary = GeometryRect(x: 0, y: 0, width: 1512, height: 982)
         let rightLower = GeometryRect(x: 1512, y: -220, width: 1728, height: 972)
         let lower = GeometryRect(x: 0, y: -1_080, width: 1512, height: 1_080)
-        let desktopTopY = [primary, rightLower, lower].map(\.maxY).max()!
+        let desktopTopY = primary.maxY
         let appKitFrame = GeometryRect(x: 1_700, y: -120, width: 700, height: 500)
 
         let accessibilityFrame = converter.appKitToAccessibility(appKitFrame, desktopTopY: desktopTopY)
         let roundTripped = converter.accessibilityToAppKit(accessibilityFrame, desktopTopY: desktopTopY)
 
+        #expect(lower.maxY < desktopTopY)
         #expect(accessibilityFrame == GeometryRect(x: 1_700, y: 602, width: 700, height: 500))
         #expect(roundTripped == appKitFrame)
         #expect(accessibilityFrame != converter.appKitToAccessibility(appKitFrame, on: rightLower))
     }
 
     @Test
-    func pointerCoordinateConversionUsesSharedTopAcrossOffsetDisplays() {
+    func pointerCoordinateConversionUsesPrimaryDisplayTopAcrossOffsetDisplays() {
         let converter = CoordinateConverter()
         let primary = GeometryRect(x: 0, y: 0, width: 1512, height: 982)
         let sameHeightNeighbor = GeometryRect(x: 1512, y: 0, width: 1512, height: 982)
         let lowerDifferentResolution = GeometryRect(x: 1512, y: -1_080, width: 1_920, height: 1_080)
-        let desktopTopY = [primary, sameHeightNeighbor, lowerDifferentResolution].map(\.maxY).max()!
+        let desktopTopY = primary.maxY
 
         let appKitPoint = GeometryPoint(x: 2_200, y: -520)
         let accessibilityPoint = converter.appKitToAccessibility(appKitPoint, desktopTopY: desktopTopY)
         let roundTripped = converter.accessibilityToAppKit(accessibilityPoint, desktopTopY: desktopTopY)
 
+        #expect(sameHeightNeighbor.maxY == desktopTopY)
+        #expect(lowerDifferentResolution.maxY < desktopTopY)
         #expect(accessibilityPoint == GeometryPoint(x: 2_200, y: 1_502))
         #expect(roundTripped == appKitPoint)
+    }
+
+    @Test
+    func tallerSecondaryDisplayDoesNotShiftPrimaryWindowGeometry() throws {
+        let converter = CoordinateConverter()
+        let primary = DisplayGeometry(
+            id: "built-in",
+            frame: GeometryRect(x: 0, y: 0, width: 1512, height: 982),
+            usableFrame: GeometryRect(x: 0, y: 0, width: 1512, height: 944)
+        )
+        let tallerSecondary = DisplayGeometry(
+            id: "external",
+            frame: GeometryRect(x: 1512, y: 0, width: 1920, height: 1080),
+            usableFrame: GeometryRect(x: 1512, y: 0, width: 1920, height: 1080)
+        )
+
+        let desktopTopY = try #require(converter.desktopTopY(for: [primary, tallerSecondary]))
+        let accessibilityFrame = converter.appKitToAccessibility(
+            primary.usableFrame,
+            desktopTopY: desktopTopY
+        )
+
+        #expect(desktopTopY == 982)
+        #expect(accessibilityFrame == GeometryRect(x: 0, y: 38, width: 1512, height: 944))
+        #expect(converter.accessibilityToAppKit(accessibilityFrame, desktopTopY: desktopTopY) == primary.usableFrame)
     }
 
     @Test
