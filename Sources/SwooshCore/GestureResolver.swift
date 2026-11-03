@@ -75,6 +75,48 @@ public struct GestureResolverOutput: Equatable, Sendable {
     }
 }
 
+public enum GestureResolverLifecycle: String, Codable, Equatable, Sendable {
+    case idle
+    case active
+    case terminal
+}
+
+public struct GestureResolverSnapshot: Equatable, Sendable {
+    public var lifecycle: GestureResolverLifecycle
+    public var target: WindowTargetIdentity?
+    public var modifierMode: GestureModifierMode
+    public var startedAtMilliseconds: Int?
+    public var topologyToken: String?
+    public var strokes: [GestureDirection]
+    public var lastStrokeEndedAtMilliseconds: Int?
+    public var committableIntent: GestureCommandIntent?
+    public var terminalOutput: GestureResolverOutput?
+
+    public init(
+        lifecycle: GestureResolverLifecycle,
+        target: WindowTargetIdentity? = nil,
+        modifierMode: GestureModifierMode = .unsupported,
+        startedAtMilliseconds: Int? = nil,
+        topologyToken: String? = nil,
+        strokes: [GestureDirection] = [],
+        lastStrokeEndedAtMilliseconds: Int? = nil,
+        committableIntent: GestureCommandIntent? = nil,
+        terminalOutput: GestureResolverOutput? = nil
+    ) {
+        self.lifecycle = lifecycle
+        self.target = target
+        self.modifierMode = modifierMode
+        self.startedAtMilliseconds = startedAtMilliseconds
+        self.topologyToken = topologyToken
+        self.strokes = strokes
+        self.lastStrokeEndedAtMilliseconds = lastStrokeEndedAtMilliseconds
+        self.committableIntent = committableIntent
+        self.terminalOutput = terminalOutput
+    }
+
+    public static let idle = GestureResolverSnapshot(lifecycle: .idle)
+}
+
 public struct GestureResolverConfiguration: Equatable, Sendable {
     public var chainTimeoutMilliseconds: Int
     public var desktopSpaceMovementHoldMilliseconds: Int
@@ -177,9 +219,9 @@ public enum GestureResolverEvent: Equatable, Sendable {
 }
 
 public final class GestureSequenceResolver {
-    private let configuration: GestureResolverConfiguration
+    private var configuration: GestureResolverConfiguration
     private var session: GestureSession?
-    private var completed = false
+    private var terminalOutput: GestureResolverOutput?
     private var processedEventIDs: Set<String> = []
 
     public init(configuration: GestureResolverConfiguration = GestureResolverConfiguration()) {
@@ -224,12 +266,41 @@ public final class GestureSequenceResolver {
         session?.topologyToken
     }
 
+    public var snapshot: GestureResolverSnapshot {
+        if let session {
+            return GestureResolverSnapshot(
+                lifecycle: .active,
+                target: session.target,
+                modifierMode: session.modifierMode,
+                startedAtMilliseconds: session.startedAt,
+                topologyToken: session.topologyToken,
+                strokes: session.strokes,
+                lastStrokeEndedAtMilliseconds: session.lastEndedAt,
+                committableIntent: command(for: session).map {
+                    GestureCommandIntent(command: $0, target: session.target, modifierMode: session.modifierMode)
+                }
+            )
+        }
+
+        if let terminalOutput {
+            return GestureResolverSnapshot(lifecycle: .terminal, terminalOutput: terminalOutput)
+        }
+
+        return .idle
+    }
+
+    public func updateConfiguration(_ configuration: GestureResolverConfiguration) -> GestureResolverOutput {
+        let invalidation = session == nil ? GestureResolverOutput.none : cancel(.gestureCancelled)
+        self.configuration = configuration
+        return invalidation
+    }
+
     public func process(_ event: GestureResolverEvent) -> GestureResolverOutput {
-        if completed, case .begin = event {
+        if terminalOutput != nil, case .begin = event {
             reset()
         }
 
-        guard !completed else {
+        guard terminalOutput == nil else {
             return .none
         }
 
@@ -237,14 +308,12 @@ public final class GestureSequenceResolver {
         case .begin(let start):
             reset()
             guard let target = start.target else {
-                completed = true
-                return .passThrough
+                return finish(.passThrough)
             }
 
             let modifierMode = mode(for: start.modifiers)
             guard modifierMode != .unsupported else {
-                completed = true
-                return .passThrough
+                return finish(.passThrough)
             }
 
             session = GestureSession(
@@ -347,7 +416,7 @@ public final class GestureSequenceResolver {
 
     public func reset() {
         session = nil
-        completed = false
+        terminalOutput = nil
         processedEventIDs.removeAll()
     }
 
@@ -520,7 +589,7 @@ public final class GestureSequenceResolver {
     }
 
     private func finish(_ output: GestureResolverOutput) -> GestureResolverOutput {
-        completed = true
+        terminalOutput = output
         session = nil
         return output
     }

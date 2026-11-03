@@ -141,6 +141,12 @@ public struct SnapGeometryEngine {
     public init() {}
 
     public func frame(for destination: SnapDestination, on display: DisplayGeometry, gridSpacing: Int) -> GeometryRect {
+        // Maximize is not a grid slot: it must consume the complete usable frame.
+        // Applying the snap gap here leaves an unexpected border around the window.
+        if destination == .maximize {
+            return display.usableFrame
+        }
+
         let gap = clampedGap(gridSpacing, for: display.usableFrame)
         let slot = slotDescription(for: destination)
         let usable = display.usableFrame
@@ -346,6 +352,20 @@ private extension GeometryRect {
 public struct CoordinateConverter {
     public init() {}
 
+    /// Accessibility's global Y origin is the top of the primary AppKit
+    /// display (the display whose frame starts at 0,0), not the tallest top
+    /// edge across every connected display. Using the latter shifts windows
+    /// when a taller secondary display is aligned with the primary display.
+    public func desktopTopY(for displays: [DisplayGeometry]) -> Double? {
+        if let primary = displays.first(where: {
+            abs($0.frame.x) < 0.001 && abs($0.frame.y) < 0.001
+        }) {
+            return primary.frame.maxY
+        }
+
+        return displays.first?.frame.maxY
+    }
+
     public func appKitToAccessibility(_ rect: GeometryRect, on displayFrame: GeometryRect) -> GeometryRect {
         appKitToAccessibility(rect, desktopTopY: displayFrame.maxY)
     }
@@ -431,7 +451,7 @@ public final class SystemWindowFrameController: WindowFrameControlling {
     private let converter = CoordinateConverter()
     private let displayProvider = SystemDisplayProvider()
 
-    public init(messagingTimeout: Float = 2.0) {
+    public init(messagingTimeout: Float = 0.5) {
         self.messagingTimeout = messagingTimeout
     }
 
@@ -511,6 +531,23 @@ public final class SystemWindowFrameController: WindowFrameControlling {
 
     private func setAccessibilityFrame(_ frame: GeometryRect, for window: AXUIElement) -> Bool {
         AXUIElementSetMessagingTimeout(window, messagingTimeout)
+        // A window left in the native zoomed state can accept AX position/size
+        // writes but immediately restore its previous zoom frame. Leave that
+        // state before applying any deterministic snap geometry.
+        var zoomedSettable = DarwinBoolean(false)
+        if AXUIElementIsAttributeSettable(
+            window,
+            "AXZoomed" as CFString,
+            &zoomedSettable
+        ) == .success,
+           zoomedSettable.boolValue {
+            _ = AXUIElementSetAttributeValue(
+                window,
+                "AXZoomed" as CFString,
+                kCFBooleanFalse
+            )
+        }
+
         var point = CGPoint(x: frame.x, y: frame.y)
         var size = CGSize(width: frame.width, height: frame.height)
         guard let pointValue = AXValueCreate(.cgPoint, &point),
@@ -543,7 +580,7 @@ public final class SystemWindowFrameController: WindowFrameControlling {
     }
 
     private func desktopTopY() -> Double? {
-        displayProvider.displays().map(\.frame.maxY).max()
+        converter.desktopTopY(for: displayProvider.displays())
     }
 
     private func distance(from rect: GeometryRect, to displayFrame: GeometryRect) -> Double {

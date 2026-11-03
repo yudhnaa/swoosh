@@ -1,14 +1,30 @@
 import Foundation
 
+public enum CapturePhysicalOwnershipState: Equatable, Sendable {
+    case idle
+    case owned(CapturedGestureSource)
+    case draining(Set<CapturedGestureSource>)
+}
+
 public final class CaptureEventOwnershipGate {
     private var owner: CapturedGestureSource?
-    private var ignoredSources: Set<CapturedGestureSource> = []
+    private var drainingSources: Set<CapturedGestureSource> = []
+
+    public var physicalState: CapturePhysicalOwnershipState {
+        if let owner {
+            return .owned(owner)
+        }
+        if !drainingSources.isEmpty {
+            return .draining(drainingSources)
+        }
+        return .idle
+    }
 
     public init() {}
 
     public func reset() {
         owner = nil
-        ignoredSources.removeAll()
+        drainingSources.removeAll()
     }
 
     public func shouldAccept(_ event: CapturedGestureEvent) -> Bool {
@@ -17,65 +33,80 @@ public final class CaptureEventOwnershipGate {
             return true
         }
 
-        if ignoredSources.contains(source) {
+        if drainingSources.contains(source) {
             if event.endsContactSequence {
-                ignoredSources.remove(source)
+                drainingSources.remove(source)
             }
             return false
         }
 
-        switch event {
-        case .began:
-            guard let owner else {
-                self.owner = source
-                return true
-            }
+        if let owner {
             guard owner == source else {
-                ignoredSources.insert(source)
-                return false
-            }
-            return true
-
-        default:
-            guard let owner else {
-                self.owner = source
-                return true
-            }
-            guard owner == source else {
-                ignoredSources.insert(source)
-                if event.endsContactSequence {
-                    ignoredSources.remove(source)
+                if !event.endsContactSequence {
+                    drainingSources.insert(source)
                 }
                 return false
             }
+            if event.endsContactSequence {
+                self.owner = nil
+            }
             return true
+        }
+
+        switch physicalState {
+        case .idle:
+            guard event.startsContactSequence else {
+                return false
+            }
+            owner = source
+            return true
+        case .draining:
+            if !event.endsContactSequence {
+                drainingSources.insert(source)
+            }
+            return false
+        case .owned:
+            preconditionFailure("Owned state must have an owner")
         }
     }
 
     public func releaseOwner(for event: CapturedGestureEvent? = nil) {
-        guard let event else {
-            owner = nil
+        guard let owner else {
             return
         }
+        if let event {
+            guard event.endsContactSequence,
+                  !event.source.isSpecified || event.source == owner else {
+                return
+            }
+        }
+        self.owner = nil
+    }
 
-        let source = event.source
-        guard source.isSpecified else {
-            owner = nil
+    /// Completes the logical gesture while retaining physical ownership until
+    /// the originating device reports that its contacts have actually ended.
+    public func drainOwnerUntilTerminal() {
+        guard let owner else {
             return
         }
-
-        if owner == source {
-            owner = nil
-        }
+        drainingSources.insert(owner)
+        self.owner = nil
     }
 }
 
 public extension CapturedGestureEvent {
+    var startsContactSequence: Bool {
+        if case .began = self {
+            return true
+        }
+        return false
+    }
+
     var endsContactSequence: Bool {
         switch self {
-        case .strokeEnded, .pinchEnded, .tapEnded, .ended, .deviceEnded, .cancelled, .deviceCancelled:
+        case .pinchEnded, .tapEnded, .ended, .deviceEnded, .cancelled, .deviceCancelled:
             true
-        case .began, .movement, .deviceMovement, .changed:
+        case .began, .movement, .deviceMovement, .changed, .strokeEnded:
             false
         }
     }

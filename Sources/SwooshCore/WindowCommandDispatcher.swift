@@ -157,6 +157,62 @@ public final class KeyboardWindowCommandDispatcher {
         return WindowCommandResult(command: command, status: .unavailable, target: target, reason: "No dispatcher mapping exists for command.")
     }
 
+    public func dispatch(_ command: KeyboardCommand) async -> WindowCommandResult {
+        guard command.isMVPKeyboardCommand else {
+            return WindowCommandResult(
+                command: command,
+                status: .unavailable,
+                reason: "Command is not available in this build."
+            )
+        }
+
+        switch targetResolver.frontmostKeyboardTarget() {
+        case .failure(let failure):
+            return WindowCommandResult(command: command, status: .targetFailure, reason: "\(failure)")
+        case .success(let target):
+            return await dispatch(command, to: target.identity)
+        }
+    }
+
+    public func dispatch(_ command: KeyboardCommand, to target: WindowTargetIdentity) async -> WindowCommandResult {
+        if let transition = lifecycleController.guardGeometryCommand(for: target), command.isGeometryCommand {
+            return WindowCommandResult(
+                command: command,
+                status: .transitioning,
+                target: target,
+                reason: transition.reason
+            )
+        }
+
+        if let destination = command.snapDestination {
+            return performSnap(destination, command: command, target: target)
+        }
+
+        if let action = command.centerRestoreAction {
+            return performCenterRestore(action, command: command, target: target)
+        }
+
+        if let direction = command.displayMoveDirection {
+            return performDisplayMove(direction, command: command, target: target)
+        }
+
+        if let direction = command.desktopSpaceMoveDirection {
+            return await performDesktopSpaceMoveAsync(direction, command: command, target: target)
+        }
+
+        if let lifecycleAction = command.lifecycleAction {
+            let result = lifecycleController.perform(lifecycleAction, for: target)
+            return WindowCommandResult(
+                command: command,
+                status: result.windowCommandStatus,
+                target: target,
+                reason: result.reason
+            )
+        }
+
+        return WindowCommandResult(command: command, status: .unavailable, target: target, reason: "No dispatcher mapping exists for command.")
+    }
+
     public func isFullscreen(_ target: WindowTargetIdentity) -> Bool? {
         lifecycleController.isFullscreen(target)
     }
@@ -187,12 +243,15 @@ public final class KeyboardWindowCommandDispatcher {
     }
 
     private func performSnap(_ destination: SnapDestination, command: KeyboardCommand, target: WindowTargetIdentity) -> WindowCommandResult {
-        guard let display = displayProvider() else {
-            return WindowCommandResult(command: command, status: .unavailable, target: target, reason: "No active display is available.")
-        }
-
         guard let originalFrame = frameController.frame(for: target) else {
             return WindowCommandResult(command: command, status: .geometryFailed, target: target, reason: "Could not read current target frame.")
+        }
+
+        let displays = activeDisplays()
+        guard !displays.isEmpty,
+              let display = DisplayMovementPlanner(snapEngine: geometryEngine).display(containing: originalFrame, in: displays)
+        else {
+            return WindowCommandResult(command: command, status: .unavailable, target: target, reason: "No active display contains the target window.")
         }
 
         let requested = geometryEngine.frame(for: destination, on: display, gridSpacing: gridSpacingProvider())
@@ -325,11 +384,40 @@ public final class KeyboardWindowCommandDispatcher {
         }
 
         let displays = activeDisplays()
-        guard let desktopTopY = displays.map(\.frame.maxY).max() else {
+        guard let desktopTopY = CoordinateConverter().desktopTopY(for: displays) else {
             return WindowCommandResult(command: command, status: .unavailable, target: target, reason: "No active display is available.")
         }
 
         let result = desktopSpaceMover.moveWindow(
+            target: target,
+            frame: currentFrame,
+            direction: direction,
+            desktopTopY: desktopTopY
+        )
+
+        return WindowCommandResult(
+            command: command,
+            status: result.status.windowCommandStatus,
+            target: target,
+            reason: result.reason
+        )
+    }
+
+    private func performDesktopSpaceMoveAsync(
+        _ direction: DesktopSpaceMoveDirection,
+        command: KeyboardCommand,
+        target: WindowTargetIdentity
+    ) async -> WindowCommandResult {
+        guard let currentFrame = frameController.frame(for: target) else {
+            return WindowCommandResult(command: command, status: .geometryFailed, target: target, reason: "Could not read current target frame.")
+        }
+
+        let displays = activeDisplays()
+        guard let desktopTopY = CoordinateConverter().desktopTopY(for: displays) else {
+            return WindowCommandResult(command: command, status: .unavailable, target: target, reason: "No active display is available.")
+        }
+
+        let result = await desktopSpaceMover.moveWindow(
             target: target,
             frame: currentFrame,
             direction: direction,

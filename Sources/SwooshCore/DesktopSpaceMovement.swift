@@ -30,6 +30,7 @@ public struct DesktopSpaceMovementResult: Equatable, Sendable {
 struct DesktopSpaceTargetActivationResult: Equatable {
     var succeeded: Bool
     var reason: String?
+    var diagnostics: [String: String] = [:]
 
     static var success: DesktopSpaceTargetActivationResult {
         DesktopSpaceTargetActivationResult(succeeded: true, reason: nil)
@@ -42,6 +43,19 @@ struct DesktopSpaceTargetActivationResult: Equatable {
 
 protocol DesktopSpaceTargetActivating {
     func activate(_ target: WindowTargetIdentity) -> DesktopSpaceTargetActivationResult
+    func dragPoint(for target: WindowTargetIdentity, defaultPoint: CGPoint, direction: DesktopSpaceMoveDirection) -> DesktopSpaceDragPointResult
+}
+
+struct DesktopSpaceDragPointResult {
+    var point: CGPoint?
+    var reason: String
+    var diagnostics: [String: String] = [:]
+}
+
+extension DesktopSpaceTargetActivating {
+    func dragPoint(for target: WindowTargetIdentity, defaultPoint: CGPoint, direction: DesktopSpaceMoveDirection) -> DesktopSpaceDragPointResult {
+        DesktopSpaceDragPointResult(point: defaultPoint, reason: "standardTitlebar")
+    }
 }
 
 public protocol DesktopSpaceMoving {
@@ -50,7 +64,123 @@ public protocol DesktopSpaceMoving {
         frame: GeometryRect,
         direction: DesktopSpaceMoveDirection,
         desktopTopY: Double
+    ) async -> DesktopSpaceMovementResult
+
+    func moveWindow(
+        target: WindowTargetIdentity,
+        frame: GeometryRect,
+        direction: DesktopSpaceMoveDirection,
+        desktopTopY: Double
     ) -> DesktopSpaceMovementResult
+}
+
+public extension DesktopSpaceMoving {
+    func moveWindow(
+        target: WindowTargetIdentity,
+        frame: GeometryRect,
+        direction: DesktopSpaceMoveDirection,
+        desktopTopY: Double
+    ) async -> DesktopSpaceMovementResult {
+        let syncMove: (WindowTargetIdentity, GeometryRect, DesktopSpaceMoveDirection, Double) -> DesktopSpaceMovementResult = self.moveWindow
+        return syncMove(target, frame, direction, desktopTopY)
+    }
+}
+
+public struct DesktopSpaceTimingProfile: Equatable, Sendable {
+    public var targetActivationDelaySeconds: TimeInterval
+    public var mouseDownToDragDelaySeconds: TimeInterval
+    public var dragToKeyDelaySeconds: TimeInterval
+    public var controlToArrowDelaySeconds: TimeInterval
+    public var keyToMouseUpDelaySeconds: TimeInterval
+
+    public init(
+        targetActivationDelaySeconds: TimeInterval,
+        mouseDownToDragDelaySeconds: TimeInterval,
+        dragToKeyDelaySeconds: TimeInterval,
+        controlToArrowDelaySeconds: TimeInterval,
+        keyToMouseUpDelaySeconds: TimeInterval
+    ) {
+        self.targetActivationDelaySeconds = targetActivationDelaySeconds
+        self.mouseDownToDragDelaySeconds = mouseDownToDragDelaySeconds
+        self.dragToKeyDelaySeconds = dragToKeyDelaySeconds
+        self.controlToArrowDelaySeconds = controlToArrowDelaySeconds
+        self.keyToMouseUpDelaySeconds = keyToMouseUpDelaySeconds
+    }
+
+    public static let missionControlDefault = DesktopSpaceTimingProfile(
+        targetActivationDelaySeconds: 0.08,
+        mouseDownToDragDelaySeconds: 0.08,
+        dragToKeyDelaySeconds: 0.08,
+        controlToArrowDelaySeconds: 0.05,
+        keyToMouseUpDelaySeconds: 0.45
+    )
+}
+
+protocol DesktopSpaceTiming {
+    func wait(for duration: TimeInterval, isCancelled: () -> Bool) throws
+}
+
+struct SystemDesktopSpaceTiming: DesktopSpaceTiming {
+    func wait(for duration: TimeInterval, isCancelled: () -> Bool) throws {
+        var remaining = max(0, duration)
+        while remaining > 0 {
+            try DesktopSpaceMoveCancellation.check(isCancelled)
+            let interval = min(remaining, 0.01)
+            Thread.sleep(forTimeInterval: interval)
+            remaining -= interval
+        }
+        try DesktopSpaceMoveCancellation.check(isCancelled)
+    }
+}
+
+private final class DesktopSpaceMoveCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    func isCancelled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    static func check(_ isCancelled: () -> Bool) throws {
+        if isCancelled() { throw DesktopSpaceMoveExecutionError.cancelled }
+    }
+}
+
+final class DesktopSpaceMoveGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isMoving = false
+
+    func begin() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isMoving else { return false }
+        isMoving = true
+        return true
+    }
+
+    func end() {
+        lock.lock()
+        isMoving = false
+        lock.unlock()
+    }
+}
+
+private enum DesktopSpaceMoveExecutionError: LocalizedError {
+    case cancelled
+
+    var errorDescription: String? {
+        switch self {
+        case .cancelled: "Desktop Spaces movement was cancelled."
+        }
+    }
 }
 
 public struct DesktopSpaceMovementEventPlan: Equatable, Sendable {
@@ -96,14 +226,14 @@ public struct DesktopSpaceMovementEventPlan: Equatable, Sendable {
     }
 }
 
-public struct MissionControlDesktopSpaceMover: DesktopSpaceMoving {
+public struct MissionControlDesktopSpaceMover: DesktopSpaceMoving, @unchecked Sendable {
     public static let titlebarYOffset: CGFloat = 10
     public static let carryDragDistance: CGFloat = 2
-    public static let mouseDownToDragDelaySeconds: TimeInterval = 0.08
-    public static let dragToKeyDelaySeconds: TimeInterval = 0.08
-    public static let controlToArrowDelaySeconds: TimeInterval = 0.05
-    public static let keyToMouseUpDelaySeconds: TimeInterval = 0.45
-    public static let targetActivationDelaySeconds: TimeInterval = 0.08
+    public static let mouseDownToDragDelaySeconds = DesktopSpaceTimingProfile.missionControlDefault.mouseDownToDragDelaySeconds
+    public static let dragToKeyDelaySeconds = DesktopSpaceTimingProfile.missionControlDefault.dragToKeyDelaySeconds
+    public static let controlToArrowDelaySeconds = DesktopSpaceTimingProfile.missionControlDefault.controlToArrowDelaySeconds
+    public static let keyToMouseUpDelaySeconds = DesktopSpaceTimingProfile.missionControlDefault.keyToMouseUpDelaySeconds
+    public static let targetActivationDelaySeconds = DesktopSpaceTimingProfile.missionControlDefault.targetActivationDelaySeconds
     public static let eventSourceStateID: CGEventSourceStateID = .hidSystemState
     public static let eventTap: CGEventTapLocation = .cghidEventTap
     public static let controlEventFlags: CGEventFlags = .maskControl
@@ -111,13 +241,51 @@ public struct MissionControlDesktopSpaceMover: DesktopSpaceMoving {
 
     private let coordinateConverter = CoordinateConverter()
     private let targetActivator: DesktopSpaceTargetActivating
+    private let postEvent: (CGEvent, CGEventTapLocation) throws -> Void
+    private let timing: any DesktopSpaceTiming
+    private let timingProfile: DesktopSpaceTimingProfile
+    private let diagnosticsSink: any DesktopSpaceDiagnosticsSink
+    private let gate: DesktopSpaceMoveGate
 
-    public init() {
-        targetActivator = SystemDesktopSpaceTargetActivator()
+    public init(
+        timingProfile: DesktopSpaceTimingProfile = .missionControlDefault,
+        diagnosticsSink: any DesktopSpaceDiagnosticsSink = NoOpDesktopSpaceDiagnosticsSink()
+    ) {
+        self.init(
+            targetActivator: SystemDesktopSpaceTargetActivator(),
+            timingProfile: timingProfile,
+            diagnosticsSink: diagnosticsSink
+        )
     }
 
-    init(targetActivator: DesktopSpaceTargetActivating) {
+    init(
+        targetActivator: DesktopSpaceTargetActivating,
+        timingProfile: DesktopSpaceTimingProfile = .missionControlDefault,
+        timing: any DesktopSpaceTiming = SystemDesktopSpaceTiming(),
+        diagnosticsSink: any DesktopSpaceDiagnosticsSink = NoOpDesktopSpaceDiagnosticsSink(),
+        gate: DesktopSpaceMoveGate = DesktopSpaceMoveGate(),
+        postEvent: @escaping (CGEvent, CGEventTapLocation) throws -> Void = { $0.post(tap: $1) }
+    ) {
         self.targetActivator = targetActivator
+        self.timingProfile = timingProfile
+        self.timing = timing
+        self.diagnosticsSink = diagnosticsSink
+        self.gate = gate
+        self.postEvent = postEvent
+    }
+
+    public func moveWindow(
+        target: WindowTargetIdentity,
+        frame: GeometryRect,
+        direction: DesktopSpaceMoveDirection,
+        desktopTopY: Double
+    ) async -> DesktopSpaceMovementResult {
+        await moveWindowAsync(
+            target: target,
+            frame: frame,
+            direction: direction,
+            desktopTopY: desktopTopY
+        )
     }
 
     public func moveWindow(
@@ -126,23 +294,96 @@ public struct MissionControlDesktopSpaceMover: DesktopSpaceMoving {
         direction: DesktopSpaceMoveDirection,
         desktopTopY: Double
     ) -> DesktopSpaceMovementResult {
+        executeMove(
+            target: target,
+            frame: frame,
+            direction: direction,
+            desktopTopY: desktopTopY,
+            cancellation: DesktopSpaceMoveCancellation()
+        )
+    }
+
+    /// Nonblocking compatibility entry point for callers that can adopt async dispatch.
+    /// The current `DesktopSpaceMoving` dispatcher contract remains synchronous.
+    public func moveWindowAsync(
+        target: WindowTargetIdentity,
+        frame: GeometryRect,
+        direction: DesktopSpaceMoveDirection,
+        desktopTopY: Double
+    ) async -> DesktopSpaceMovementResult {
+        let cancellation = DesktopSpaceMoveCancellation()
+        if Task.isCancelled { cancellation.cancel() }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(returning: executeMove(
+                        target: target,
+                        frame: frame,
+                        direction: direction,
+                        desktopTopY: desktopTopY,
+                        cancellation: cancellation
+                    ))
+                }
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
+    private func executeMove(
+        target: WindowTargetIdentity,
+        frame: GeometryRect,
+        direction: DesktopSpaceMoveDirection,
+        desktopTopY: Double,
+        cancellation: DesktopSpaceMoveCancellation
+    ) -> DesktopSpaceMovementResult {
         guard direction == .left || direction == .right else {
             return DesktopSpaceMovementResult(
                 status: .unavailable,
                 reason: "Desktop Spaces movement supports left and right directions only."
             )
         }
+        guard gate.begin() else {
+            return DesktopSpaceMovementResult(
+                status: .unavailable,
+                reason: "A Desktop Spaces movement is already in progress."
+            )
+        }
+        defer { gate.end() }
 
+        let diagnostics = diagnosticsSink.makeSession(for: target)
+        diagnostics.capture("beforeActivation")
         let activation = targetActivator.activate(target)
+        diagnostics.write("activation", details: activation.diagnostics.merging([
+            "succeeded": String(activation.succeeded), "reason": activation.reason ?? "none"
+        ]) { _, new in new })
         guard activation.succeeded else {
             return DesktopSpaceMovementResult(
                 status: .unavailable,
                 reason: activation.reason ?? "Could not activate the target window for Desktop Spaces movement."
             )
         }
-        Thread.sleep(forTimeInterval: Self.targetActivationDelaySeconds)
+        do {
+            try timing.wait(for: timingProfile.targetActivationDelaySeconds, isCancelled: cancellation.isCancelled)
+        } catch {
+            diagnostics.write("cancelledBeforeMouseDown", details: ["reason": error.localizedDescription])
+            return DesktopSpaceMovementResult(status: .failed, reason: error.localizedDescription)
+        }
 
-        let plan = eventPlan(forAppKitFrame: frame, desktopTopY: desktopTopY, direction: direction)
+        var plan = eventPlan(forAppKitFrame: frame, desktopTopY: desktopTopY, direction: direction)
+        diagnostics.capture("baselineTitlebar", plan: plan)
+        let origin = targetActivator.dragPoint(for: target, defaultPoint: plan.mouseDownPoint, direction: direction)
+        diagnostics.write("dragPointResolution", details: origin.diagnostics.merging([
+            "baselinePoint": NSStringFromPoint(plan.mouseDownPoint),
+            "selectedPoint": origin.point.map(NSStringFromPoint) ?? "unavailable",
+            "reason": origin.reason
+        ]) { _, new in new })
+        guard let point = origin.point else {
+            return DesktopSpaceMovementResult(status: .unavailable, reason: origin.reason)
+        }
+        plan.dragPoint = CGPoint(x: point.x + plan.dragPoint.x - plan.mouseDownPoint.x, y: point.y)
+        plan.mouseDownPoint = point
+        diagnostics.capture("beforeMouseDown", plan: plan)
         guard let source = CGEventSource(stateID: plan.eventSourceStateID),
               let mouseDown = CGEvent(
                 mouseEventSource: source,
@@ -183,19 +424,69 @@ public struct MissionControlDesktopSpaceMover: DesktopSpaceMoving {
         controlUp.type = .flagsChanged
         controlUp.flags = []
 
-        mouseDown.post(tap: plan.eventTap)
-        Thread.sleep(forTimeInterval: plan.mouseDownToDragDelaySeconds)
-        mouseDrag.post(tap: plan.eventTap)
-        Thread.sleep(forTimeInterval: plan.dragToKeyDelaySeconds)
-        controlDown.post(tap: plan.eventTap)
-        Thread.sleep(forTimeInterval: plan.controlToArrowDelaySeconds)
-        keyDown.post(tap: plan.eventTap)
-        keyUp.post(tap: plan.eventTap)
-        Thread.sleep(forTimeInterval: plan.keyToMouseUpDelaySeconds)
-        mouseUp.post(tap: plan.eventTap)
-        controlUp.post(tap: plan.eventTap)
+        diagnostics.write("mouseEvents", details: [
+            "downFlags": String(mouseDown.flags.rawValue),
+            "dragFlags": String(mouseDrag.flags.rawValue),
+            "dragDeltaX": String(mouseDrag.getIntegerValueField(.mouseEventDeltaX)),
+            "dragDeltaY": String(mouseDrag.getIntegerValueField(.mouseEventDeltaY))
+        ])
+        do {
+            try performHeldMouseSequence(
+                plan: plan,
+                mouseDown: mouseDown,
+                mouseDrag: mouseDrag,
+                controlDown: controlDown,
+                keyDown: keyDown,
+                keyUp: keyUp,
+                mouseUp: mouseUp,
+                controlUp: controlUp,
+                cancellation: cancellation
+            )
+        } catch {
+            // performHeldMouseSequence releases any held mouse/control state before returning.
+            diagnostics.write("sequenceFailedAfterRelease", details: ["reason": error.localizedDescription])
+            diagnostics.capture("afterRelease", plan: plan)
+            return DesktopSpaceMovementResult(status: .failed, reason: error.localizedDescription)
+        }
+        diagnostics.capture("afterRelease", plan: plan)
 
         return DesktopSpaceMovementResult(status: .performed)
+    }
+
+    private func performHeldMouseSequence(
+        plan: DesktopSpaceMovementEventPlan,
+        mouseDown: CGEvent,
+        mouseDrag: CGEvent,
+        controlDown: CGEvent,
+        keyDown: CGEvent,
+        keyUp: CGEvent,
+        mouseUp: CGEvent,
+        controlUp: CGEvent,
+        cancellation: DesktopSpaceMoveCancellation
+    ) throws {
+        var mouseIsHeld = false
+        var controlIsHeld = false
+        defer {
+            if mouseIsHeld { try? postEvent(mouseUp, plan.eventTap) }
+            if controlIsHeld { try? postEvent(controlUp, plan.eventTap) }
+        }
+
+        try DesktopSpaceMoveCancellation.check(cancellation.isCancelled)
+        try postEvent(mouseDown, plan.eventTap)
+        mouseIsHeld = true
+        try timing.wait(for: plan.mouseDownToDragDelaySeconds, isCancelled: cancellation.isCancelled)
+        try postEvent(mouseDrag, plan.eventTap)
+        try timing.wait(for: plan.dragToKeyDelaySeconds, isCancelled: cancellation.isCancelled)
+        try postEvent(controlDown, plan.eventTap)
+        controlIsHeld = true
+        try timing.wait(for: plan.controlToArrowDelaySeconds, isCancelled: cancellation.isCancelled)
+        try postEvent(keyDown, plan.eventTap)
+        try postEvent(keyUp, plan.eventTap)
+        try timing.wait(for: plan.keyToMouseUpDelaySeconds, isCancelled: cancellation.isCancelled)
+        try postEvent(mouseUp, plan.eventTap)
+        mouseIsHeld = false
+        try postEvent(controlUp, plan.eventTap)
+        controlIsHeld = false
     }
 
     func eventPlan(
@@ -229,15 +520,15 @@ public struct MissionControlDesktopSpaceMover: DesktopSpaceMoving {
             eventTap: Self.eventTap,
             controlEventFlags: Self.controlEventFlags,
             arrowEventFlags: Self.arrowEventFlags,
-            mouseDownToDragDelaySeconds: Self.mouseDownToDragDelaySeconds,
-            dragToKeyDelaySeconds: Self.dragToKeyDelaySeconds,
-            controlToArrowDelaySeconds: Self.controlToArrowDelaySeconds,
-            keyToMouseUpDelaySeconds: Self.keyToMouseUpDelaySeconds
+            mouseDownToDragDelaySeconds: timingProfile.mouseDownToDragDelaySeconds,
+            dragToKeyDelaySeconds: timingProfile.dragToKeyDelaySeconds,
+            controlToArrowDelaySeconds: timingProfile.controlToArrowDelaySeconds,
+            keyToMouseUpDelaySeconds: timingProfile.keyToMouseUpDelaySeconds
         )
     }
 }
 
-private final class SystemDesktopSpaceTargetActivator: DesktopSpaceTargetActivating {
+final class SystemDesktopSpaceTargetActivator: DesktopSpaceTargetActivating {
     private let messagingTimeout: Float
 
     init(messagingTimeout: Float = 2.0) {
@@ -258,16 +549,105 @@ private final class SystemDesktopSpaceTargetActivator: DesktopSpaceTargetActivat
         let appActivated = app.activate(options: [.activateAllWindows])
         let raiseResult = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         let focusResult = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
-        _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        let mainResult = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        let details = [
+            "appActivated": String(appActivated), "raiseAXError": String(raiseResult.rawValue),
+            "focusAXError": String(focusResult.rawValue), "mainAXError": String(mainResult.rawValue)
+        ]
 
         guard appActivated || raiseResult == .success || focusResult == .success else {
-            return .failed("Could not activate or raise the target window for Desktop Spaces movement.")
+            return DesktopSpaceTargetActivationResult(
+                succeeded: false,
+                reason: "Could not activate or raise the target window for Desktop Spaces movement.",
+                diagnostics: details
+            )
         }
 
-        return .success
+        return DesktopSpaceTargetActivationResult(succeeded: true, diagnostics: details)
     }
 
-    private func windowElement(for target: WindowTargetIdentity, in appElement: AXUIElement) -> AXUIElement? {
+    func dragPoint(for target: WindowTargetIdentity, defaultPoint: CGPoint, direction: DesktopSpaceMoveDirection) -> DesktopSpaceDragPointResult {
+        let bundleID = NSRunningApplication(processIdentifier: target.processIdentifier)?.bundleIdentifier
+        guard bundleID == "com.microsoft.VSCode" || bundleID == "com.brave.Browser" else {
+            return DesktopSpaceDragPointResult(point: defaultPoint, reason: "standardTitlebar")
+        }
+        let application = AXUIElementCreateApplication(target.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.1)
+        guard let window = windowElement(for: target, in: application),
+              let frame = DesktopSpaceDragPointSelector.frame(of: window) else {
+            return DesktopSpaceDragPointResult(point: nil, reason: "Could not read the target's custom titlebar geometry.")
+        }
+        let buttons = [kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute].compactMap {
+            DesktopSpaceDragPointSelector.elementAttribute($0, of: window)
+        }.compactMap { DesktopSpaceDragPointSelector.frame(of: $0) }
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.1)
+        var hits: [String: String] = [:]
+        let point = DesktopSpaceDragPointSelector.select(
+            frame: frame, defaultPoint: defaultPoint, buttons: buttons, direction: direction
+        ) { point in
+            var hit: AXUIElement?
+            let result = AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit)
+            let key = "hit.\(NSStringFromPoint(point))"
+            hits[key] = "AXError=\(result.rawValue)"
+            guard result == .success,
+                  let hit else { return false }
+            var role: CFTypeRef?
+            AXUIElementSetMessagingTimeout(hit, 0.1)
+            AXUIElementCopyAttributeValue(hit, kAXRoleAttribute as CFString, &role)
+            let roleName = role as? String ?? "unknown"
+            let belongsToTargetWindow = belongsToWindow(hit, targetWindow: window)
+            var rawActions: CFArray?
+            let actionResult = AXUIElementCopyActionNames(hit, &rawActions)
+            let actions = actionResult == .success ? Set((rawActions as? [String]) ?? []) : []
+            let eligible = DesktopSpaceDragPointSelector.isEligibleCustomTitlebarHit(
+                role: roleName,
+                actions: actions,
+                belongsToTargetWindow: belongsToTargetWindow
+            )
+            hits[key] = "role=\(roleName),targetWindow=\(belongsToTargetWindow),eligible=\(eligible)"
+            return eligible
+        }
+        return DesktopSpaceDragPointResult(
+            point: point,
+            reason: point == nil ? "No accessible window background was found in the custom titlebar." : "AXWindowBackground",
+            diagnostics: hits
+        )
+    }
+
+    private func belongsToWindow(_ element: AXUIElement, targetWindow: AXUIElement) -> Bool {
+        if CFEqual(element, targetWindow) {
+            return true
+        }
+
+        var rawWindow: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &rawWindow) == .success,
+           let rawWindow,
+           CFGetTypeID(rawWindow) == AXUIElementGetTypeID(),
+           CFEqual(rawWindow, targetWindow) {
+            return true
+        }
+
+        var ancestor = element
+        for _ in 0..<12 {
+            var rawParent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(ancestor, kAXParentAttribute as CFString, &rawParent) == .success,
+                  let rawParent,
+                  CFGetTypeID(rawParent) == AXUIElementGetTypeID()
+            else {
+                return false
+            }
+            let parent = rawParent as! AXUIElement
+            if CFEqual(parent, targetWindow) {
+                return true
+            }
+            AXUIElementSetMessagingTimeout(parent, 0.1)
+            ancestor = parent
+        }
+        return false
+    }
+
+    func windowElement(for target: WindowTargetIdentity, in appElement: AXUIElement) -> AXUIElement? {
         windowCandidates(for: appElement).first {
             elementIdentifier(for: $0, processIdentifier: target.processIdentifier) == target.elementIdentifier
         }

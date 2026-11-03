@@ -26,10 +26,11 @@ The goal is to make window management feel natural on macOS: quick gestures, cle
 
 ## Build
 
-Build the app bundle:
+Build a release app bundle with a stable signing identity (the production
+bundle identifier is locked to `com.yudhnaa.Swoosh`):
 
 ```bash
-scripts/build_app.sh
+scripts/build_app.sh --identity "Apple Development: Your Name (TEAMID)"
 ```
 
 Build and install to `/Applications`:
@@ -43,6 +44,17 @@ If you have a stable signing certificate, the build script will use it automatic
 ```bash
 scripts/build_app.sh --install --identity "Apple Development: Your Name (TEAMID)"
 ```
+
+For local development only, ad-hoc signing must be explicitly enabled and
+automatically uses the debug configuration:
+
+```bash
+scripts/build_app.sh --development-ad-hoc
+```
+
+The build is staged and signature-verified before either the local or installed
+bundle is replaced. The previous bundle is restored if replacement verification
+fails, and the designated requirement is recorded beside the packaged app.
 
 ## Permissions
 
