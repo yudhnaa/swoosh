@@ -380,6 +380,11 @@ public final class GestureRuntimeController: LifecycleResource {
         publishStatus()
 
         guard self.settings.gesturesEnabled, !self.settings.isPaused, permissionReady, captureReady else {
+            onCaptureDiagnostics(stoppedCaptureDiagnostics(
+                preserving: permissions.privateMultitouch,
+                permissionReady: permissionReady,
+                captureReady: captureReady
+            ))
             updateDebug("capture stopped: gestures=\(self.settings.gesturesEnabled) paused=\(self.settings.isPaused) permissions=\(permissionReady) prereq=\(captureReady)")
             return
         }
@@ -461,6 +466,35 @@ public final class GestureRuntimeController: LifecycleResource {
         } else if context.hasPrefix("capture refresh") {
             scheduleCaptureRecoveryIfNeeded()
         }
+    }
+
+    private func stoppedCaptureDiagnostics(
+        preserving diagnostics: PrivateCaptureDiagnostics,
+        permissionReady: Bool,
+        captureReady: Bool
+    ) -> PrivateCaptureDiagnostics {
+        let reason: String
+        if !settings.gesturesEnabled {
+            reason = "Capture is stopped because gestures are disabled."
+        } else if settings.isPaused {
+            reason = "Capture is stopped while Swoosh is paused."
+        } else if !permissionReady {
+            reason = "Capture is stopped because required permissions are unavailable."
+        } else if !captureReady {
+            reason = diagnostics.reason
+        } else {
+            reason = "Capture is stopped."
+        }
+
+        return PrivateCaptureDiagnostics(
+            frameworkAvailable: diagnostics.frameworkAvailable,
+            requiredSymbolsAvailable: diagnostics.requiredSymbolsAvailable,
+            deviceCount: diagnostics.deviceCount,
+            startedDeviceCount: 0,
+            failedDeviceCount: 0,
+            started: false,
+            reason: reason
+        )
     }
 
     private func scheduleCaptureRecoveryIfNeeded() {

@@ -96,6 +96,22 @@ struct GestureRuntimeControllerTests {
     }
 
     @Test
+    func settingsPausePublishesStoppedCaptureDiagnostics() {
+        let harness = makeHarness()
+        harness.start()
+
+        var paused = harness.settings
+        paused.isPaused = true
+        harness.controller.apply(settings: paused, permissions: .readyForGestureTests)
+
+        let diagnostics = harness.captureDiagnostics.last
+        #expect(diagnostics?.started == false)
+        #expect(diagnostics?.startedDeviceCount == 0)
+        #expect(diagnostics?.deviceCount == 1)
+        #expect(diagnostics?.reason == "Capture is stopped while Swoosh is paused.")
+    }
+
+    @Test
     func topologyChangeCancelsPendingCommit() {
         let topology = MutableTopologyToken("topology-a")
         let harness = makeHarness(topologyTokenProvider: { topology.value })
@@ -316,6 +332,7 @@ private final class RuntimeHarness {
 
     var previewedCommands: [KeyboardCommand] { callbacks.previewedCommands }
     var controllerStatus: GestureInputStatus? { callbacks.controllerStatus }
+    var captureDiagnostics: [PrivateCaptureDiagnostics] { callbacks.captureDiagnostics }
 
     init(settings: SwooshSettings, topologyTokenProvider: @escaping () -> String) {
         self.settings = settings
@@ -334,6 +351,7 @@ private final class RuntimeHarness {
             scheduler: scheduler,
             clock: FixedGestureRuntimeClock(nowMilliseconds: 5_000),
             topologyTokenProvider: topologyTokenProvider,
+            onCaptureDiagnostics: { [callbacks] diagnostics in callbacks.captureDiagnostics.append(diagnostics) },
             onStatusChanged: { [callbacks] status, _ in callbacks.controllerStatus = status },
             onPreviewChanged: { [callbacks] command, _, _, _ in callbacks.previewedCommands.append(command) }
         )
@@ -348,6 +366,7 @@ private final class RuntimeHarness {
 private final class RuntimeCallbackRecorder {
     var previewedCommands: [KeyboardCommand] = []
     var controllerStatus: GestureInputStatus?
+    var captureDiagnostics: [PrivateCaptureDiagnostics] = []
 }
 
 @MainActor
