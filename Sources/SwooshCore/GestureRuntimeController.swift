@@ -355,6 +355,11 @@ public final class GestureRuntimeController: LifecycleResource {
     public func apply(settings: SwooshSettings, permissions: PermissionDiagnostics) {
         self.settings = settings.normalized
         scheduler.cancelAll()
+        // `apply` is the explicit capture-reconfiguration boundary (permission,
+        // pause, enablement, or sensitivity changes). Stop first so an
+        // idempotent capture source still rebuilds recognizers with the exact
+        // newly persisted settings.
+        capture.stop()
         captureRefreshScheduled = false
         captureRecoveryAttempt = 0
         previewLatencyTracker.reset()
@@ -375,7 +380,6 @@ public final class GestureRuntimeController: LifecycleResource {
         publishStatus()
 
         guard self.settings.gesturesEnabled, !self.settings.isPaused, permissionReady, captureReady else {
-            capture.stop()
             updateDebug("capture stopped: gestures=\(self.settings.gesturesEnabled) paused=\(self.settings.isPaused) permissions=\(permissionReady) prereq=\(captureReady)")
             return
         }

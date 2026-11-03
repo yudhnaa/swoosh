@@ -403,6 +403,9 @@ private final class MockRuntimeCapture: GestureCaptureSource, @unchecked Sendabl
     private var handler: (@MainActor @Sendable (CapturedGestureEvent) -> Void)?
 
     func start(handler: @escaping @MainActor @Sendable (CapturedGestureEvent) -> Void) -> GestureCaptureSourceStatus {
+        if self.handler != nil, case .running = snapshot.status {
+            return snapshot.status
+        }
         let generation = snapshot.generation + 1
         self.handler = handler
         let status = GestureCaptureSourceStatus.running(.readyForGestureTests)
@@ -416,6 +419,9 @@ private final class MockRuntimeCapture: GestureCaptureSource, @unchecked Sendabl
     }
 
     func stop() {
+        guard handler != nil || snapshot.status != .stopped else {
+            return
+        }
         snapshot = GestureCaptureSnapshot(status: .stopped, generation: snapshot.generation + 1)
         handler = nil
     }
