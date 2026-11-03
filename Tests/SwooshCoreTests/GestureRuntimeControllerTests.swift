@@ -143,6 +143,28 @@ struct GestureRuntimeControllerTests {
         #expect(harness.controllerStatus == .failed)
         #expect(!harness.scheduler.contains(.chainTimeout))
         #expect(harness.dispatcher.commands.isEmpty)
+        #expect(harness.scheduler.delay(for: .captureRefresh) == 1_000)
+    }
+
+    @Test
+    func captureRecoveryContinuesAtBoundedRateUntilListenerRecovers() {
+        let harness = makeHarness()
+        harness.start()
+        harness.capture.refreshResult = .failed(.failedForGestureTests)
+        harness.controller.captureDevicesDidChange()
+
+        for _ in 0..<15 {
+            #expect(harness.scheduler.contains(.captureRefresh))
+            harness.scheduler.run(.captureRefresh)
+        }
+
+        #expect(harness.scheduler.delay(for: .captureRefresh) == 5_000)
+
+        harness.capture.refreshResult = .running(.readyForGestureTests)
+        harness.scheduler.run(.captureRefresh)
+
+        #expect(!harness.scheduler.contains(.captureRefresh))
+        #expect(harness.controllerStatus == .running)
     }
 
     @Test

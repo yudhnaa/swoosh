@@ -237,7 +237,8 @@ public final class GestureRuntimeController: LifecycleResource {
     private var lastStartedCaptureDeviceCount = 0
     private let captureDeviceChangeDebounceMilliseconds = 350
     private let captureRecoveryRetryMilliseconds = 1_000
-    private let maximumCaptureRecoveryAttempts = 12
+    private let captureRecoverySustainedRetryMilliseconds = 5_000
+    private let captureRecoveryBackoffAttempt = 12
 
     // ── FIFO Mailbox & Session Revision ─────────────────────────────
     // Events that arrive while an async target lookup is in flight are
@@ -455,12 +456,12 @@ public final class GestureRuntimeController: LifecycleResource {
         let startedSummary = diagnostics.startedDeviceCount > 0
             ? "\(diagnostics.startedDeviceCount)/\(max(diagnostics.deviceCount, diagnostics.startedDeviceCount))"
             : "\(diagnostics.started)"
+        coordinator.listenerRecovered()
         onCaptureDiagnostics(diagnostics)
         if forceDebug || deviceCountsChanged || diagnostics.failedDeviceCount > 0 {
             updateDebug("\(context): devices=\(diagnostics.deviceCount) started=\(startedSummary)")
             publishStatus()
         }
-        coordinator.listenerRecovered()
         if diagnostics.failedDeviceCount == 0, diagnostics.startedDeviceCount > 0 {
             captureRecoveryAttempt = 0
         } else if context.hasPrefix("capture refresh") {
@@ -502,15 +503,15 @@ public final class GestureRuntimeController: LifecycleResource {
             captureRecoveryAttempt = 0
             return
         }
-        guard captureRecoveryAttempt < maximumCaptureRecoveryAttempts else {
-            updateDebug("capture recovery waiting for device change: devices=\(lastCaptureDeviceCount) started=\(lastStartedCaptureDeviceCount)")
-            publishStatus()
-            return
-        }
-        captureRecoveryAttempt += 1
+        captureRecoveryAttempt = min(captureRecoveryAttempt + 1, captureRecoveryBackoffAttempt)
+        let isSustainedRecovery = captureRecoveryAttempt >= captureRecoveryBackoffAttempt
         scheduleCaptureDeviceRefresh(
-            reason: "device recovery \(captureRecoveryAttempt)/\(maximumCaptureRecoveryAttempts)",
-            delayMilliseconds: captureRecoveryRetryMilliseconds
+            reason: isSustainedRecovery
+                ? "sustained device recovery"
+                : "device recovery \(captureRecoveryAttempt)/\(captureRecoveryBackoffAttempt)",
+            delayMilliseconds: isSustainedRecovery
+                ? captureRecoverySustainedRetryMilliseconds
+                : captureRecoveryRetryMilliseconds
         )
     }
 
@@ -531,11 +532,16 @@ public final class GestureRuntimeController: LifecycleResource {
             case .running(let refreshed):
                 self.handleCaptureRunning(refreshed, context: "capture refresh: \(reason)", forceDebug: false)
             case .failed(let refreshed):
+                self.lastCaptureDeviceCount = refreshed.deviceCount
+                self.lastStartedCaptureDeviceCount = refreshed.startedDeviceCount
                 self.onCaptureDiagnostics(refreshed)
                 self.invalidatePendingGesture(.captureFailed, at: self.clock.nowMilliseconds)
                 self.coordinator.listenerFailed()
                 self.updateDebug("capture refresh failed after \(reason): \(refreshed.reason)")
                 self.publishStatus()
+                if refreshed.frameworkAvailable, refreshed.requiredSymbolsAvailable {
+                    self.scheduleCaptureRecoveryIfNeeded()
+                }
             case .stopped:
                 self.updateDebug("capture refresh after \(reason): stopped")
                 self.publishStatus()

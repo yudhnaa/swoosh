@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 protocol WindowAutomationBackend: Sendable {
@@ -122,6 +123,7 @@ public actor WindowAutomationService {
     public typealias GridSpacingProvider = @Sendable () -> Int
 
     private let makeBackend: @Sendable () -> any WindowAutomationBackend
+    private let excludedProcessIdentifier: pid_t?
     private var storedBackend: (any WindowAutomationBackend)?
     private var automationTurnInFlight = false
     private var automationTurnWaiters: [CheckedContinuation<Void, Never>] = []
@@ -132,6 +134,7 @@ public actor WindowAutomationService {
         displayListProvider: @escaping DisplayListProvider = { SystemDisplayProvider().displays() },
         gridSpacingProvider: @escaping GridSpacingProvider = { 0 }
     ) {
+        excludedProcessIdentifier = getpid()
         makeBackend = {
             DefaultWindowAutomationBackend(
                 permissionState: permissionState,
@@ -142,7 +145,11 @@ public actor WindowAutomationService {
         }
     }
 
-    init(backend: @escaping @Sendable () -> any WindowAutomationBackend) {
+    init(
+        backend: @escaping @Sendable () -> any WindowAutomationBackend,
+        excludedProcessIdentifier: pid_t? = nil
+    ) {
+        self.excludedProcessIdentifier = excludedProcessIdentifier
         makeBackend = backend
     }
 
@@ -151,15 +158,15 @@ public actor WindowAutomationService {
         fallingBackToFrontmost fallbackToFrontmost: Bool = false
     ) async -> Result<WindowTarget, WindowTargetFailure> {
         await withAutomationTurn {
-            backend.targetUnderPointer(
+            excludingHostProcess(backend.targetUnderPointer(
                 at: point,
                 fallingBackToFrontmost: fallbackToFrontmost
-            )
+            ))
         }
     }
 
     public func frontmostKeyboardTarget() async -> Result<WindowTarget, WindowTargetFailure> {
-        await withAutomationTurn { backend.frontmostKeyboardTarget() }
+        await withAutomationTurn { excludingHostProcess(backend.frontmostKeyboardTarget()) }
     }
 
     public func frame(for target: WindowTargetIdentity) async -> GeometryRect? {
@@ -193,14 +200,35 @@ public actor WindowAutomationService {
     }
 
     public func dispatch(_ command: KeyboardCommand) async -> WindowCommandResult {
-        await withAutomationTurn { await backend.dispatch(command) }
+        await withAutomationTurn {
+            guard excludedProcessIdentifier != nil else {
+                return await backend.dispatch(command)
+            }
+            switch excludingHostProcess(backend.frontmostKeyboardTarget()) {
+            case .success(let target):
+                return await backend.dispatch(command, to: target.identity)
+            case .failure(.excludedSurface(let surface)) where surface == "selfProcess":
+                return unavailableSelfTargetResult(for: command)
+            case .failure:
+                return WindowCommandResult(
+                    command: command,
+                    status: .targetFailure,
+                    reason: "No eligible target window is available."
+                )
+            }
+        }
     }
 
     public func dispatch(
         _ command: KeyboardCommand,
         to target: WindowTargetIdentity
     ) async -> WindowCommandResult {
-        await withAutomationTurn { await backend.dispatch(command, to: target) }
+        await withAutomationTurn {
+            guard !isHostProcess(target) else {
+                return unavailableSelfTargetResult(for: command, target: target)
+            }
+            return await backend.dispatch(command, to: target)
+        }
     }
 
     public func displayMovementPreview(
@@ -214,6 +242,31 @@ public actor WindowAutomationService {
         await acquireAutomationTurn()
         defer { releaseAutomationTurn() }
         return await operation()
+    }
+
+    private func excludingHostProcess(
+        _ result: Result<WindowTarget, WindowTargetFailure>
+    ) -> Result<WindowTarget, WindowTargetFailure> {
+        guard case .success(let target) = result, isHostProcess(target.identity) else {
+            return result
+        }
+        return .failure(.excludedSurface("selfProcess"))
+    }
+
+    private func isHostProcess(_ target: WindowTargetIdentity) -> Bool {
+        excludedProcessIdentifier == target.processIdentifier
+    }
+
+    private func unavailableSelfTargetResult(
+        for command: KeyboardCommand,
+        target: WindowTargetIdentity? = nil
+    ) -> WindowCommandResult {
+        WindowCommandResult(
+            command: command,
+            status: .unavailable,
+            target: target,
+            reason: "The automation host cannot target its own windows."
+        )
     }
 
     private func acquireAutomationTurn() async {

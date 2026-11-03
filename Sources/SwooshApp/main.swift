@@ -185,6 +185,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindowController?.show()
     }
 
+    fileprivate func updateActivationPolicy(showInDock: Bool) {
+        NSApplication.shared.setActivationPolicy(showInDock ? .regular : .accessory)
+        guard settingsWindowController?.isVisible == true else {
+            return
+        }
+
+        // Changing from a regular app to an accessory app can deactivate the
+        // process and send its visible window behind the current application.
+        // Reactivate after AppKit finishes the policy transition.
+        DispatchQueue.main.async { [weak self] in
+            self?.settingsWindowController?.show()
+        }
+    }
+
     private func handleKeyboardCommand(_ command: KeyboardCommand) async {
         await model.handleKeyboardCommand(command)
     }
@@ -584,7 +598,7 @@ private final class SettingsModel: ObservableObject {
         runtimeSettings.apply(normalized)
 
         if normalized.showInDock != previous.showInDock {
-            NSApplication.shared.setActivationPolicy(normalized.showInDock ? .regular : .accessory)
+            (NSApp.delegate as? AppDelegate)?.updateActivationPolicy(showInDock: normalized.showInDock)
         }
         if normalized.showInMenuBar != previous.showInMenuBar {
             (NSApp.delegate as? AppDelegate)?.statusController?.updateVisibility(show: normalized.showInMenuBar)
@@ -818,9 +832,12 @@ private final class SettingsWindowController {
     }
 
     func show() {
-        window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
+
+    var isVisible: Bool { window.isVisible }
 }
 
 @MainActor
